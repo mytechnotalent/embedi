@@ -6,7 +6,7 @@
 
 # Embedi
 
-Hands-free open-source embedded-systems AI assistant named Embedi that records speech, transcribes it with Groq Whisper, chats with Llama 3.3, and replies through macOS text-to-speech.
+Embedi — hands‑free open‑source embedded AI: speech capture, Groq Whisper transcription, Llama 3.3 chat, macOS TTS, UART control for Pico robotics.
 
 <br>
 
@@ -46,6 +46,20 @@ export GROQ_API_KEY=sk_your_key
 cargo run --release
 ```
 The binary prompts you every few seconds, records ~5 seconds of audio, and responds once Whisper returns text. Say "quit", "stop", or "goodbye" to exit.
+
+<br>
+
+# Raspberry Pi Pico LED Control
+- Flash your Pico with the UART listener shown above (or any firmware that reacts to the strings `ON` and `OFF`).
+- Plug the board into your Mac; note the device path (e.g., `/dev/tty.usbmodem21302`).
+- Optional: override the defaults via environment variables before launching Embedi:
+
+```bash
+export EMBEDI_SERIAL_PORT=/dev/tty.usbmodem21302
+export EMBEDI_SERIAL_BAUD=115200
+```
+
+When Embedi hears phrases like "turn the LED on" or "disable the Pico light," it sends the matching command over that UART without waiting for the LLM round-trip, and you'll hear a spoken confirmation.
 
 <br>
 
