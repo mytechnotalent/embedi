@@ -63,7 +63,7 @@ When Embedi hears phrases like "turn the LED on" or "disable the Pico light," it
 
 <br>
 
-# `rp2350-comms/` Firmware
+# `rp2350-comms` Firmware
 - Lives under `rp2350-comms/` and provides the bare-metal UART/LED helper that Embedi talks to.
 - Hardware: a Raspberry Pi Pico 2 (RP2350), a Pico Debug Probe for SWD flashing, and a single LED plus 100 Ω resistor in series on GPIO16 (anode to GP16, cathode through the resistor to GND).
 - Wiring & flash steps:
