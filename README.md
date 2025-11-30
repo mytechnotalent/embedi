@@ -63,6 +63,19 @@ When Embedi hears phrases like "turn the LED on" or "disable the Pico light," it
 
 <br>
 
+# `rp2350-comms/` Firmware
+- Lives under `rp2350-comms/` and provides the bare-metal UART/LED helper that Embedi talks to.
+- Hardware: a Raspberry Pi Pico 2 (RP2350), a Pico Debug Probe for SWD flashing, and a single LED plus 100 Ω resistor in series on GPIO16 (anode to GP16, cathode through the resistor to GND).
+- Wiring & flash steps:
+	1. Plug the Pico Debug Probe into your Mac, wire SWDIO/SWCLK/GND to the Pico 2 header, and keep the Pico's USB cable connected for power and UART back to macOS.
+	2. Drop the LED/resistor pair between GPIO16 and GND so the firmware has something to toggle when ON/OFF strings arrive.
+	3. `cd rp2350-comms`
+	4. (One time) `rustup target add thumbv8m.main-none-eabihf`
+	5. `cargo run --release` — the bundled `.cargo/config.toml` calls `picotool` by default; set `PICOTOOL_PATH` or swap the runner for `probe-rs run --chip RP2350` if you prefer flashing over the debug probe.
+- Once flashed, return to the repo root, run `cargo run --release` for Embedi, and it will drive the Pico over the default `/dev/tty.usbmodem21302` / `115200` UART (override via the env vars above if your port differs).
+
+<br>
+
 # Testing
 ```bash
 cargo test

@@ -1,5 +1,12 @@
-/target
+# MacOS
+.DS_Store
 
+# Target folders
+target/
+**/target/
+
+# env
 .env
 
+# memory file
 memory.json
