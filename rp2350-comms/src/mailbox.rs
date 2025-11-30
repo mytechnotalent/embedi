@@ -1,6 +1,6 @@
 /*
- * @file globals.rs
- * @brief Global ring buffer state shared between IRQ and main loop
+ * @file mailbox.rs
+ * @brief Shared RX mailbox between the UART IRQ and main loop
  * @author Kevin Thomas
  * @date 2025
  *
@@ -27,38 +27,41 @@
  * SOFTWARE.
  */
 
-use crate::ring_buffer::RingBuffer;
+use crate::config::RX_BUF_SIZE;
 use core::cell::{Cell, RefCell};
 use critical_section::Mutex;
+use heapless::Deque;
 
-static RX_BUFFER: Mutex<RefCell<RingBuffer>> = Mutex::new(RefCell::new(RingBuffer::new()));
+type RxQueue = Deque<u8, RX_BUF_SIZE>;
+
+static RX_QUEUE: Mutex<RefCell<RxQueue>> = Mutex::new(RefCell::new(Deque::new()));
 static RX_OVERFLOWED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 
-/// Attempts to enqueue a byte into the shared ring buffer.
+/// Attempts to enqueue a byte from the UART interrupt context.
 ///
 /// # Parameters
-/// * `byte` - The UART byte to push.
+/// * `byte` - The received UART byte to store.
 ///
 /// # Returns
-/// `true` when the byte was stored; `false` if the buffer was full.
+/// `true` when the byte was stored, `false` if the queue was full.
 pub fn push_byte(byte: u8) -> bool {
-    critical_section::with(|cs| RX_BUFFER.borrow_ref_mut(cs).push(byte))
+    critical_section::with(|cs| RX_QUEUE.borrow_ref_mut(cs).push_back(byte).is_ok())
 }
 
-/// Pops one byte from the shared ring buffer if available.
+/// Pops the next byte for the foreground loop if one exists.
 ///
 /// # Returns
-/// `Some` byte when data exists, otherwise `None`.
+/// `Some` byte when data is available, otherwise `None`.
 pub fn pop_byte() -> Option<u8> {
-    critical_section::with(|cs| RX_BUFFER.borrow_ref_mut(cs).pop())
+    critical_section::with(|cs| RX_QUEUE.borrow_ref_mut(cs).pop_front())
 }
 
-/// Flags that the RX buffer overflowed inside the interrupt context.
+/// Marks that the interrupt handler observed a queue overflow.
 pub fn mark_overflow() {
     critical_section::with(|cs| RX_OVERFLOWED.borrow(cs).set(true));
 }
 
-/// Returns and clears the overflow flag.
+/// Returns and clears the overflow flag so the app can log it once.
 ///
 /// # Returns
 /// `true` if an overflow occurred since the last call.

@@ -58,7 +58,7 @@ const TEMP_AUDIO_PATH: &str = "temp.wav";
 ///
 /// Keeping the delay configurable makes it easy to tweak responsiveness
 /// without touching the main loop.
-const PRE_RECORD_DELAY: Duration = Duration::from_millis(500);
+const PRE_RECORD_DELAY: Duration = Duration::from_millis(200);
 
 /// Minimum RMS amplitude considered speech.
 ///
@@ -66,8 +66,11 @@ const PRE_RECORD_DELAY: Duration = Duration::from_millis(500);
 /// we bias toward a lower threshold and rely on Whisper to filter background noise.
 const SILENCE_RMS_THRESHOLD: f32 = 150.0;
 
-/// Default serial device Embedi uses to reach the Raspberry Pi Pico.
-const DEFAULT_SERIAL_PORT: &str = "/dev/cu.usbmodem1402";
+/// Path to the JSON configuration file that holds runtime defaults.
+const CONFIG_PATH: &str = "config.json";
+
+/// Default serial device Embedi uses to reach the Raspberry Pi Pico when no config exists.
+const FALLBACK_SERIAL_PORT: &str = "/dev/cu.usbmodem21402";
 
 /// Persistent memory log that accumulates every exchange Embedi hears.
 const MEMORY_PATH: &str = "memory.json";
@@ -79,16 +82,16 @@ const DEFAULT_SERIAL_BAUD: u32 = 115_200;
 const SERIAL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Time to let the Pico reboot after the UART is opened (DTR toggle).
-const SERIAL_BOOT_DELAY: Duration = Duration::from_millis(250);
+const SERIAL_BOOT_DELAY: Duration = Duration::from_millis(150);
 
 /// Minimum spacing between consecutive UART commands.
-const SERIAL_COMMAND_DELAY: Duration = Duration::from_millis(75);
+const SERIAL_COMMAND_DELAY: Duration = Duration::from_millis(30);
 
 /// Bytes to pull from the UART echo buffer per read.
 const SERIAL_READ_CHUNK: usize = 256;
 
 /// How long to wait for a Pico acknowledgment before retrying.
-const SERIAL_ACK_TIMEOUT: Duration = Duration::from_millis(300);
+const SERIAL_ACK_TIMEOUT: Duration = Duration::from_millis(180);
 
 /// Sleep between acknowledgment polling iterations.
 const SERIAL_ACK_SLEEP: Duration = Duration::from_millis(15);
@@ -104,6 +107,21 @@ const LED_ON_ACK_TOKENS: &[&str] = &["led on", "led: on", "on"];
 
 /// Lowercase tokens that count as an acknowledgement for LED OFF commands.
 const LED_OFF_ACK_TOKENS: &[&str] = &["led off", "led: off", "off"];
+
+/// Strongly typed representation of `config.json`.
+#[derive(Clone, Deserialize)]
+struct AppConfig {
+    #[serde(default = "fallback_serial_port")]
+    default_serial_port: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            default_serial_port: fallback_serial_port(),
+        }
+    }
+}
 
 /// Runs the fully hands-free voice assistant loop until the user says quits.
 ///
@@ -153,11 +171,12 @@ impl VoiceAssistantRuntime {
                 history.push(message);
             }
         }
+        let config = load_app_config();
         Ok(Self {
             client: groq::Client::from_env(),
             history,
             serial: None,
-            serial_path: serial_port_path(),
+            serial_path: serial_port_path(&config),
             serial_baud: serial_baud_rate(),
             memory: memory_entries,
             led_context_active: false,
@@ -659,8 +678,8 @@ fn drain_serial_input(port: &mut dyn SerialPort) {
     }
 }
 
-fn serial_port_path() -> String {
-    env::var("EMBEDI_SERIAL_PORT").unwrap_or_else(|_| DEFAULT_SERIAL_PORT.to_string())
+fn serial_port_path(config: &AppConfig) -> String {
+    env::var("EMBEDI_SERIAL_PORT").unwrap_or_else(|_| config.default_serial_port.clone())
 }
 
 fn serial_baud_rate() -> u32 {
@@ -722,6 +741,27 @@ fn persist_memory(entries: &[MemoryEntry]) -> Result<()> {
     let json = serde_json::to_string_pretty(entries)
         .with_context(|| format!("Failed to serialize {}", MEMORY_PATH))?;
     fs::write(MEMORY_PATH, json).with_context(|| format!("Failed to write {}", MEMORY_PATH))
+}
+
+/// Loads configuration from `config.json`, falling back to baked defaults when missing.
+fn load_app_config() -> AppConfig {
+    match fs::read_to_string(CONFIG_PATH) {
+        Ok(raw) => match serde_json::from_str(&raw) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!("Config parse error ({}): {}", CONFIG_PATH, err);
+                AppConfig::default()
+            }
+        },
+        Err(err) => {
+            eprintln!("Config load error ({}): {}", CONFIG_PATH, err);
+            AppConfig::default()
+        }
+    }
+}
+
+fn fallback_serial_port() -> String {
+    FALLBACK_SERIAL_PORT.to_string()
 }
 
 #[cfg(test)]

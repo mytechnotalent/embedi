@@ -28,12 +28,25 @@
  */
 
 use crate::config;
+use crate::hal::gpio::bank0::{Gpio0, Gpio1, Gpio16};
+use crate::hal::gpio::{FunctionSioOutput, FunctionUart, Pin, PullDown};
+use crate::hal::uart::{DataBits, Enabled, FifoWatermark, StopBits, UartConfig, UartPeripheral};
 use crate::hal::{self, Clock};
-use crate::types::{AppUart, AppUartPins, LedPin};
 use embedded_hal::digital::OutputPin;
 use fugit::RateExtU32;
 use hal::gpio::Pins;
-use hal::uart::{DataBits, FifoWatermark, StopBits, UartConfig, UartPeripheral};
+
+type Device = crate::hal::pac::UART0;
+
+/// Alias for the status LED pin configured as SIO output with pulldown.
+pub type LedPin = Pin<Gpio16, FunctionSioOutput, PullDown>;
+/// UART TX/RX pin pair switched into UART function.
+pub type AppUartPins = (
+    Pin<Gpio0, FunctionUart, PullDown>,
+    Pin<Gpio1, FunctionUart, PullDown>,
+);
+/// UART handle used throughout the firmware.
+pub type AppUart = UartPeripheral<Enabled, Device, AppUartPins>;
 
 /// Aggregates the peripherals needed by the application loop.
 pub struct Runtime {

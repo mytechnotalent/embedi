@@ -1,6 +1,6 @@
 /*
- * @file types.rs
- * @brief Type aliases for pins and UART peripherals
+ * @file bootinfo.rs
+ * @brief Boot and tooling metadata for the RP2350 firmware
  * @author Kevin Thomas
  * @date 2025
  *
@@ -27,15 +27,11 @@
  * SOFTWARE.
  */
 
-use crate::hal::gpio::bank0::{Gpio0, Gpio1, Gpio16};
-use crate::hal::gpio::{FunctionSioOutput, FunctionUart, Pin, PullDown};
-use crate::hal::uart::{Enabled, UartPeripheral};
+#[cfg(rp2350)]
+use crate::hal;
 
-type Device = crate::hal::pac::UART0;
-
-pub type LedPin = Pin<Gpio16, FunctionSioOutput, PullDown>;
-pub type AppUartPins = (
-    Pin<Gpio0, FunctionUart, PullDown>,
-    Pin<Gpio1, FunctionUart, PullDown>,
-);
-pub type AppUart = UartPeripheral<Enabled, Device, AppUartPins>;
+/// Tell the Boot ROM about our application
+#[unsafe(link_section = ".start_block")]
+#[used]
+#[cfg(rp2350)]
+pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();

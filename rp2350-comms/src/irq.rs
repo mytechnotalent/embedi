@@ -27,9 +27,9 @@
  * SOFTWARE.
  */
 
-use crate::globals;
 use crate::hal;
 use crate::hal::pac::interrupt;
+use crate::mailbox;
 
 /// UART0 interrupt handler that drains the RX FIFO into the software buffer.
 ///
@@ -62,8 +62,8 @@ fn unmask_uart_irq() {
 fn drain_fifo(uart: &hal::pac::uart0::RegisterBlock) {
     while uart.uartfr().read().rxfe().bit_is_clear() {
         let byte = uart.uartdr().read().data().bits();
-        if !globals::push_byte(byte) {
-            globals::mark_overflow();
+        if !mailbox::push_byte(byte) {
+            mailbox::mark_overflow();
         }
     }
 }

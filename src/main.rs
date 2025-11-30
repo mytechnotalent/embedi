@@ -31,7 +31,6 @@
 //! hands-free Groq-powered voice assistant loop.
 
 use anyhow::Result;
-
 use embedi::assistant;
 
 #[tokio::main]

@@ -29,9 +29,8 @@
 
 //! Text-to-speech functionality module.
 
-use std::sync::Mutex;
-
 use anyhow::Result;
+use std::sync::Mutex;
 
 /// Speaks the given text using macOS `say` command.
 ///

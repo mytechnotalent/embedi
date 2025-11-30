@@ -28,9 +28,8 @@
  */
 
 use crate::config::{MSG_OFF, MSG_ON, PRINTABLE_RANGE, READY_MSG};
-use crate::globals;
-use crate::hardware::Runtime;
-use crate::types::AppUart;
+use crate::hardware::{AppUart, Runtime};
+use crate::mailbox;
 use core::hint::spin_loop;
 use defmt::{info, warn};
 use embedded_hal::digital::OutputPin;
@@ -65,12 +64,12 @@ pub fn run(runtime: &mut Runtime) -> ! {
 /// * `runtime` - Provides UART and LED access.
 /// * `detector` - Tracks recent characters for keyword detection.
 fn process_bytes(runtime: &mut Runtime, detector: &mut Detector) {
-    while let Some(byte) = globals::pop_byte() {
+    while let Some(byte) = mailbox::pop_byte() {
         echo_byte(&mut runtime.uart, byte);
-        if PRINTABLE_RANGE.contains(&byte) {
-            if let Some(hit) = detector.track(byte) {
-                act_on_detection(runtime, hit);
-            }
+        if PRINTABLE_RANGE.contains(&byte)
+            && let Some(hit) = detector.track(byte)
+        {
+            act_on_detection(runtime, hit);
         }
     }
 }
@@ -106,7 +105,7 @@ fn act_on_detection(runtime: &mut Runtime, detection: Detection) {
 
 /// Emits a log warning if the RX FIFO overflowed.
 fn report_overflow() {
-    if globals::take_overflow() {
+    if mailbox::take_overflow() {
         warn!("RX buffer was full, dropped incoming bytes");
     }
 }
