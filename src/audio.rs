@@ -31,12 +31,12 @@
 //!
 //! This module handles microphone input recording using CPAL and WAV file operations.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Stream, StreamConfig, StreamError};
+use cpal::{Device, SampleFormat, Stream, StreamConfig, StreamError};
 use hound::{WavSpec, WavWriter};
 
 /// Sample rate for audio recording (16kHz).
@@ -79,13 +79,20 @@ const RECORD_DURATION: Duration = Duration::from_secs(5);
 /// ```
 pub fn record_audio() -> Result<Vec<i16>> {
     let device = default_input_device()?;
-    let config = input_config();
+    let resolved = negotiate_input_config(&device)?;
     let samples = shared_samples();
-    let stream = build_input_stream(&device, &config, samples.clone())?;
+    log_channel_notice(resolved.config.channels);
+    log_sample_rate_notice(resolved.config.sample_rate.0);
+    let stream = build_input_stream(&device, &resolved, samples.clone())?;
     stream.play()?;
     std::thread::sleep(RECORD_DURATION);
     drop(stream);
-    Ok(samples.lock().unwrap().clone())
+    let captured = samples.lock().unwrap().clone();
+    Ok(resample_to_target_rate(
+        &captured,
+        resolved.config.sample_rate.0,
+        SAMPLE_RATE,
+    ))
 }
 
 /// Saves audio samples to a WAV file.
@@ -136,18 +143,36 @@ fn default_input_device() -> Result<Device> {
         .ok_or_else(|| anyhow::anyhow!("No input device"))
 }
 
-/// Builds the CPAL stream configuration used by the recorder.
+/// Negotiates a stream configuration supported by the selected device.
 ///
-/// The configuration uses mono audio, a 16 kHz sample rate, and a default buffer.
-///
-/// # Returns
-/// A [`StreamConfig`] tailored to Whisper-friendly audio settings.
-fn input_config() -> StreamConfig {
-    StreamConfig {
-        channels: CHANNELS,
-        sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Default,
+/// Prefers 16 kHz mono audio and falls back to the device default when
+/// those constraints are unavailable.
+fn negotiate_input_config(device: &Device) -> Result<ResolvedStreamConfig> {
+    if let Ok(configs) = device.supported_input_configs() {
+        for range in configs {
+            if range.channels() == CHANNELS
+                && range.min_sample_rate().0 <= SAMPLE_RATE
+                && SAMPLE_RATE <= range.max_sample_rate().0
+            {
+                let supported = range.with_sample_rate(cpal::SampleRate(SAMPLE_RATE));
+                let mut config = supported.config();
+                config.buffer_size = cpal::BufferSize::Default;
+                return Ok(ResolvedStreamConfig {
+                    config,
+                    sample_format: supported.sample_format(),
+                });
+            }
+        }
     }
+    let supported = device
+        .default_input_config()
+        .map_err(|err| anyhow::anyhow!("Default input config error: {}", err))?;
+    let mut config = supported.config();
+    config.buffer_size = cpal::BufferSize::Default;
+    Ok(ResolvedStreamConfig {
+        config,
+        sample_format: supported.sample_format(),
+    })
 }
 
 /// Creates the shared buffer that accumulates captured samples.
@@ -172,18 +197,46 @@ fn shared_samples() -> Arc<Mutex<Vec<i16>>> {
 /// Returns any stream-construction issues wrapped in [`anyhow::Error`].
 fn build_input_stream(
     device: &Device,
-    config: &StreamConfig,
+    resolved: &ResolvedStreamConfig,
     samples: Arc<Mutex<Vec<i16>>>,
 ) -> Result<Stream> {
-    let shared = samples.clone();
-    device
-        .build_input_stream(
-            config,
-            move |data: &[f32], _: &_| push_samples(&shared, data),
-            log_stream_error,
-            None,
-        )
-        .map_err(|err| anyhow::anyhow!(err))
+    let channel_count = resolved.config.channels.max(1);
+    match resolved.sample_format {
+        SampleFormat::F32 => {
+            let shared = samples.clone();
+            device.build_input_stream(
+                &resolved.config,
+                move |data: &[f32], _: &_| push_samples_from_f32(&shared, data, channel_count),
+                log_stream_error,
+                None,
+            )
+        }
+        SampleFormat::I16 => {
+            let shared = samples.clone();
+            device.build_input_stream(
+                &resolved.config,
+                move |data: &[i16], _: &_| push_samples_from_i16(&shared, data, channel_count),
+                log_stream_error,
+                None,
+            )
+        }
+        SampleFormat::U16 => {
+            let shared = samples;
+            device.build_input_stream(
+                &resolved.config,
+                move |data: &[u16], _: &_| push_samples_from_u16(&shared, data, channel_count),
+                log_stream_error,
+                None,
+            )
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unsupported microphone sample format {:?}; please report",
+                other
+            ));
+        }
+    }
+    .map_err(|err| anyhow::anyhow!(err))
 }
 
 /// Converts floating-point frames into 16-bit PCM and appends them to the buffer.
@@ -194,11 +247,95 @@ fn build_input_stream(
 ///
 /// # Returns
 /// Nothing; the buffer is mutated in place.
-fn push_samples(buffer: &Arc<Mutex<Vec<i16>>>, data: &[f32]) {
+fn push_samples_from_f32(buffer: &Arc<Mutex<Vec<i16>>>, data: &[f32], channels: u16) {
+    push_normalized_samples(buffer, data, channels);
+}
+
+fn push_samples_from_i16(buffer: &Arc<Mutex<Vec<i16>>>, data: &[i16], channels: u16) {
+    let normalized: Vec<f32> = data
+        .iter()
+        .map(|&sample| sample as f32 / i16::MAX as f32)
+        .collect();
+    push_normalized_samples(buffer, &normalized, channels);
+}
+
+fn push_samples_from_u16(buffer: &Arc<Mutex<Vec<i16>>>, data: &[u16], channels: u16) {
+    let normalized: Vec<f32> = data
+        .iter()
+        .map(|&sample| (sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
+        .collect();
+    push_normalized_samples(buffer, &normalized, channels);
+}
+
+fn push_normalized_samples(buffer: &Arc<Mutex<Vec<i16>>>, data: &[f32], channels: u16) {
+    let ch = channels.max(1) as usize;
     let mut guard = buffer.lock().unwrap();
-    for &sample in data {
-        guard.push((sample * i16::MAX as f32) as i16);
+    for frame in data.chunks(ch) {
+        let mono = frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32;
+        let clamped = (mono * i16::MAX as f32)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32);
+        guard.push(clamped as i16);
     }
+}
+
+fn resample_to_target_rate(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
+    if samples.len() < 2 || from_rate == to_rate {
+        return samples.to_vec();
+    }
+    let ratio = to_rate as f32 / from_rate as f32;
+    let new_len = ((samples.len() as f32) * ratio).round().max(1.0) as usize;
+    let mut output = Vec::with_capacity(new_len);
+    for n in 0..new_len {
+        let position = n as f32 / ratio;
+        let mut idx = position.floor() as usize;
+        if idx >= samples.len() {
+            idx = samples.len() - 1;
+        }
+        let next_idx = (idx + 1).min(samples.len() - 1);
+        let frac = position - idx as f32;
+        let s0 = samples[idx] as f32;
+        let s1 = samples[next_idx] as f32;
+        let interpolated = s0 + (s1 - s0) * frac;
+        let clamped = interpolated.round().clamp(i16::MIN as f32, i16::MAX as f32);
+        output.push(clamped as i16);
+    }
+    output
+}
+
+/// Memoized notice that we had to downmix channels.
+static CHANNEL_NOTICE: Once = Once::new();
+/// Memoized notice that we had to resample from the hardware's preferred rate.
+static SAMPLE_RATE_NOTICE: Once = Once::new();
+
+fn log_channel_notice(actual_channels: u16) {
+    if actual_channels == CHANNELS {
+        return;
+    }
+    CHANNEL_NOTICE.call_once(|| {
+        eprintln!(
+            "ℹ️ Microphone exposes {} channel input; downmixing to mono for Whisper.",
+            actual_channels
+        );
+    });
+}
+
+fn log_sample_rate_notice(actual_rate: u32) {
+    if actual_rate == SAMPLE_RATE {
+        return;
+    }
+    SAMPLE_RATE_NOTICE.call_once(|| {
+        eprintln!(
+            "ℹ️ Microphone defaults to {} Hz; resampling to Whisper-friendly 16000 Hz.",
+            actual_rate
+        );
+    });
+}
+
+#[derive(Clone)]
+struct ResolvedStreamConfig {
+    config: StreamConfig,
+    sample_format: SampleFormat,
 }
 
 /// Logs recoverable stream errors emitted by CPAL.
@@ -219,13 +356,6 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn input_config_matches_constants() {
-        let config = input_config();
-        assert_eq!(config.channels, CHANNELS);
-        assert_eq!(config.sample_rate.0, SAMPLE_RATE);
-    }
-
-    #[test]
     fn shared_samples_starts_empty() {
         let samples = shared_samples();
         assert!(samples.lock().unwrap().is_empty());
@@ -234,12 +364,21 @@ mod tests {
     #[test]
     fn push_samples_converts_floats() {
         let samples = shared_samples();
-        push_samples(&samples, &[0.0, 0.5, -1.0]);
+        push_samples_from_f32(&samples, &[0.0, 0.5, -1.0], 1);
         let guard = samples.lock().unwrap();
         assert_eq!(guard.len(), 3);
         assert_eq!(guard[0], 0);
         assert!(guard[1] > 0);
         assert!(guard[2] < 0);
+    }
+
+    #[test]
+    fn push_samples_downmixes_channels() {
+        let samples = shared_samples();
+        push_samples_from_f32(&samples, &[1.0, -1.0], 2);
+        let guard = samples.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0], 0);
     }
 
     #[test]
@@ -250,5 +389,12 @@ mod tests {
         save_wav(&temp_str, &samples).expect("save wav");
         assert!(Path::new(&temp_str).exists());
         fs::remove_file(temp_path).ok();
+    }
+
+    #[test]
+    fn resample_changes_length() {
+        let source = vec![0_i16; 1600];
+        let resampled = resample_to_target_rate(&source, 16000, 8000);
+        assert_eq!(resampled.len(), 800);
     }
 }

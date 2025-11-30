@@ -67,7 +67,7 @@ const PRE_RECORD_DELAY: Duration = Duration::from_millis(500);
 const SILENCE_RMS_THRESHOLD: f32 = 150.0;
 
 /// Default serial device Embedi uses to reach the Raspberry Pi Pico.
-const DEFAULT_SERIAL_PORT: &str = "/dev/cu.usbmodem21302";
+const DEFAULT_SERIAL_PORT: &str = "/dev/cu.usbmodem1402";
 
 /// Persistent memory log that accumulates every exchange Embedi hears.
 const MEMORY_PATH: &str = "memory.json";
