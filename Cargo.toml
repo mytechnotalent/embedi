@@ -1,0 +1,16 @@
+[package]
+name = "embedi"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.bundle]
+name = "Embedi"
+identifier = "com.embedi"
+
+[dependencies]
+rig-core = { version = "0.24", features = ["audio"] }
+tokio = { version = "1.42", features = ["full"] }
+anyhow = "1.0"
+hound = "3.5"
+cpal = "0.16"
+dotenv = "0.15"
