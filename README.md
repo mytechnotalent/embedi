@@ -23,7 +23,7 @@ Embedi — hands‑free open‑source embedded AI: speech capture, local Whisper
 - macOS with working microphone and `say` command (available by default).
 - Rust 1.78+ (or latest stable) and Cargo.
 - Ollama installed and running (`brew install ollama` or download from https://ollama.ai).
-- Default model: `llama3.1:8b` (auto-downloaded on first run, ~4.7GB).
+- Default model: `qwen2.5:14b` (auto-downloaded on first run, ~9GB).
 
 <br>
 
@@ -142,9 +142,9 @@ Edit `config.json` to customize:
 ```json
 {
     "default_serial_port": "/dev/cu.usbmodem1402",
-    "default_ollama_model": "llama3.1:8b",
-    "_comment_default": "llama3.1:8b - Official Meta model optimized for chat with 128K context (~4.7GB)",
-    "_comment_alternatives": "Lighter: llama3.2:3b | Advanced: llama4:scout, llama3.3:70b"
+    "default_ollama_model": "qwen2.5:14b",
+    "_comment_default": "qwen2.5:14b - Superior reasoning and conversational ability (~9GB)",
+    "_comment_alternatives": "Lighter: qwen2.5:7b, llama3.2:3b | Heavier: qwen2.5:32b, llama4:scout"
 }
 ```
 
@@ -170,7 +170,7 @@ Override via environment variables:
 ```bash
 export EMBEDI_SERIAL_PORT=/dev/cu.usbmodem1402
 export EMBEDI_SERIAL_BAUD=115200
-export OLLAMA_MODEL=llama3.1:8b
+export OLLAMA_MODEL=qwen2.5:14b
 ```
 
 <br>
