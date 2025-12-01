@@ -1,0 +1,14 @@
+{
+    "commands": [
+        {
+            "keywords": ["turn on", "on", "light on", "led on"],
+            "uart_command": "ON",
+            "description": "Turn LED on"
+        },
+        {
+            "keywords": ["turn off", "off", "light off", "led off"],
+            "uart_command": "OFF",
+            "description": "Turn LED off"
+        }
+    ]
+}

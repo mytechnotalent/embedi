@@ -30,15 +30,15 @@
 //! Voice assistant orchestration module.
 
 use crate::audio::{record_audio, save_wav};
+use crate::commands;
 use crate::speech::speak;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serialport::SerialPort;
 use std::{
     env, fs,
-    io::ErrorKind,
     path::Path,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Temporary file used for passing audio samples to Whisper.
@@ -86,26 +86,7 @@ const SERIAL_BOOT_DELAY: Duration = Duration::from_millis(150);
 /// Minimum spacing between consecutive UART commands.
 const SERIAL_COMMAND_DELAY: Duration = Duration::from_millis(30);
 
-/// Bytes to pull from the UART echo buffer per read.
-const SERIAL_READ_CHUNK: usize = 256;
 
-/// How long to wait for a Pico acknowledgment before retrying.
-const SERIAL_ACK_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Sleep between acknowledgment polling iterations.
-const SERIAL_ACK_SLEEP: Duration = Duration::from_millis(15);
-
-/// Tokens that explicitly mention the Pico LED hardware.
-const LED_TARGET_TOKENS: &[&str] = &["led", "light", "lights", "gpio", "pin"];
-
-/// Pronoun tokens that we allow once an LED command has been executed.
-const LED_PRONOUN_TOKENS: &[&str] = &["it", "thing", "that", "this", "one"];
-
-/// Lowercase tokens that count as an acknowledgement for LED ON commands.
-const LED_ON_ACK_TOKENS: &[&str] = &["led on", "led: on"];
-
-/// Lowercase tokens that count as an acknowledgement for LED OFF commands.
-const LED_OFF_ACK_TOKENS: &[&str] = &["led off", "led: off"];
 
 /// Strongly typed representation of `config.json`.
 #[derive(Clone, Deserialize)]
@@ -141,7 +122,7 @@ impl Default for AppConfig {
 /// # Errors
 /// Returns an error only if Groq initialization fails before the loop starts.
 pub async fn run_voice_assistant() -> Result<()> {
-    VoiceAssistantRuntime::new()?.run_loop().await
+    VoiceAssistantRuntime::new().await?.run_loop().await
 }
 
 /// Cleans up temporary files created during operation.
@@ -165,7 +146,8 @@ struct VoiceAssistantRuntime {
     serial_path: String,
     serial_baud: u32,
     memory: Vec<MemoryEntry>,
-    led_context_active: bool,
+    commands: commands::CommandsConfig,
+    device_context_active: bool,
 }
 
 /// Chat message structure for Ollama API.
@@ -215,12 +197,13 @@ impl VoiceAssistantRuntime {
     ///
     /// # Errors
     /// Propagates failures from initialization.
-    fn new() -> Result<Self> {
+    async fn new() -> Result<Self> {
         // Ensure Ollama is ready before proceeding
-        Self::ensure_ollama_ready()?;
+        Self::ensure_ollama_ready().await?;
         let memory_entries = Self::load_memory_with_fallback();
         let history = Self::build_chat_history(&memory_entries);
         let config = load_app_config();
+        let commands_config = commands::load_commands();
         let ollama_model =
             env::var("OLLAMA_MODEL").unwrap_or_else(|_| config.default_ollama_model.clone());
         Ok(Self {
@@ -232,7 +215,8 @@ impl VoiceAssistantRuntime {
             serial_path: serial_port_path(&config),
             serial_baud: serial_baud_rate(),
             memory: memory_entries,
-            led_context_active: false,
+            commands: commands_config,
+            device_context_active: false,
         })
     }
 
@@ -299,12 +283,12 @@ impl VoiceAssistantRuntime {
     ///
     /// # Errors
     /// Returns an error if Ollama cannot be started or the model cannot be downloaded.
-    fn ensure_ollama_ready() -> Result<()> {
+    async fn ensure_ollama_ready() -> Result<()> {
         let config = load_app_config();
         let model =
             env::var("OLLAMA_MODEL").unwrap_or_else(|_| config.default_ollama_model.clone());
-        Self::ensure_ollama_service()?;
-        Self::ensure_ollama_model(&model)?;
+        Self::ensure_ollama_service().await?;
+        Self::ensure_ollama_model(&model).await?;
         Ok(())
     }
 
@@ -323,13 +307,13 @@ impl VoiceAssistantRuntime {
     ///
     /// # Errors
     /// Returns an error if Ollama cannot be started or is not installed.
-    fn ensure_ollama_service() -> Result<()> {
+    async fn ensure_ollama_service() -> Result<()> {
         eprintln!("Checking Ollama service...");
-        if !Self::is_ollama_running() {
+        if !Self::is_ollama_running().await {
             eprintln!("Ollama not running, attempting to start...");
             Self::start_ollama_service()?;
-            std::thread::sleep(Duration::from_secs(3));
-            if !Self::is_ollama_running() {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            if !Self::is_ollama_running().await {
                 anyhow::bail!(
                     "Failed to start Ollama service. Please install Ollama from https://ollama.ai"
                 );
@@ -354,9 +338,9 @@ impl VoiceAssistantRuntime {
     ///
     /// # Errors
     /// Returns an error if the model query fails or download is unsuccessful.
-    fn ensure_ollama_model(model: &str) -> Result<()> {
+    async fn ensure_ollama_model(model: &str) -> Result<()> {
         eprintln!("Checking for model {}...", model);
-        if !Self::has_ollama_model(model)? {
+        if !Self::has_ollama_model(model).await? {
             eprintln!("Model {} not found, downloading...", model);
             eprintln!("This may take several minutes depending on your connection.");
             Self::pull_ollama_model(model)?;
@@ -375,12 +359,12 @@ impl VoiceAssistantRuntime {
     ///
     /// # Returns
     /// * `bool` - `true` if Ollama responds, `false` otherwise.
-    fn is_ollama_running() -> bool {
-        let client = reqwest::blocking::Client::builder()
+    async fn is_ollama_running() -> bool {
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        client.get("http://localhost:11434/api/tags").send().is_ok()
+        client.get("http://localhost:11434/api/tags").send().await.is_ok()
     }
 
     /// Attempts to start the Ollama service in the background.
@@ -428,14 +412,16 @@ impl VoiceAssistantRuntime {
     ///
     /// # Errors
     /// Returns an error if the API request fails.
-    fn has_ollama_model(model_name: &str) -> Result<bool> {
-        let client = reqwest::blocking::Client::new();
+    async fn has_ollama_model(model_name: &str) -> Result<bool> {
+        let client = reqwest::Client::new();
         let response = client
             .get("http://localhost:11434/api/tags")
             .send()
+            .await
             .with_context(|| "Failed to query Ollama models")?;
         let json: serde_json::Value = response
             .json()
+            .await
             .with_context(|| "Failed to parse Ollama response")?;
         if let Some(models) = json["models"].as_array() {
             for model in models {
@@ -992,23 +978,27 @@ impl VoiceAssistantRuntime {
     /// # Returns
     /// * `bool` - `true` if a device command was detected and handled, `false` otherwise.
     fn try_device_command(&mut self, user_text: &str) -> bool {
-        let allow_pronoun_reference = self.led_context_active;
-        let Some(command) = DeviceCommand::from_text(user_text, allow_pronoun_reference) else {
-            return false;
-        };
-        let spoken = match self.send_device_command(command) {
-            Ok(_) => {
-                self.led_context_active = true;
-                command.success_message().to_string()
-            }
-            Err(err) => {
-                eprintln!("Serial command error: {}", err);
-                "I couldn't reach the Pico controller just yet.".to_string()
-            }
-        };
-        self.store_exchange(user_text, &spoken);
-        self.speak_response(&spoken);
-        true
+        // First try commands.json for extensible commands
+        let normalized = user_text.to_lowercase();
+        let cmd_match = commands::find_command(&self.commands, &normalized)
+            .map(|c| (c.uart_command.clone(), c.description.clone()));
+        
+        if let Some((uart_cmd, description)) = cmd_match {
+            let spoken = match self.send_raw_uart_command(&uart_cmd) {
+                Ok(_) => {
+                    self.device_context_active = true;
+                    format!("{}.", description)
+                }
+                Err(err) => {
+                    eprintln!("Serial command error: {}", err);
+                    "I couldn't reach the Pico controller just yet.".to_string()
+                }
+            };
+            self.store_exchange(user_text, &spoken);
+            self.speak_response(&spoken);
+            return true;
+        }
+        false
     }
 
     /// Requests an Ollama completion given the latest user input.
@@ -1022,19 +1012,23 @@ impl VoiceAssistantRuntime {
     /// # Errors
     /// Translates Ollama-specific errors into [`anyhow::Error`].
     async fn fetch_response(&mut self, user_text: &str) -> Result<String> {
+        let cmd_list = commands::generate_command_list(&self.commands);
+        let system_content = format!(
+            "You are Embedi, an embedded-systems AI assistant. Your name is pronounced \
+            'em bee dee'—like Auntie Em, the letter B, then the letter D. Share that \
+            phrasing only when someone asks or when pronunciation confusion blocks the \
+            conversation, and always add that any close pronunciation is fine. Stay \
+            personable, concise, friendly, and a little playful while keeping guidance \
+            grounded in embedded-systems thinking. Never sound combative or defensive \
+            about your name. Keep replies short and conversational, and when asked who \
+            created you, cite Kevin Thomas as your creator. When users want to control \
+            hardware, you can send commands over a Raspberry Pi Pico UART link. \
+            \n{}",
+            cmd_list
+        );
         let system_message = ChatMessage {
             role: "system".to_string(),
-            content: "You are Embedi, an embedded-systems AI assistant. Your name is pronounced \
-                'em bee dee'—like Auntie Em, the letter B, then the letter D. Share that \
-                phrasing only when someone asks or when pronunciation confusion blocks the \
-                conversation, and always add that any close pronunciation is fine. Stay \
-                personable, concise, friendly, and a little playful while keeping guidance \
-                grounded in embedded-systems thinking. Never sound combative or defensive \
-                about your name. Keep replies short and conversational, and when asked who \
-                created you, cite Kevin Thomas as your creator. When users want to toggle \
-                hardware, explain that you can speak over a Raspberry Pi Pico UART link to \
-                flip its LED on or off and confirm what action you just triggered."
-                .to_string(),
+            content: system_content,
         };
         let mut messages = vec![system_message];
         messages.extend(self.history.clone());
@@ -1194,392 +1188,40 @@ fn should_quit(user_text: &str) -> bool {
         .any(|word| normalized.contains(word))
 }
 
-/// Commands that can be executed locally without a round-trip to the LLM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeviceCommand {
-    LedOn,
-    LedOff,
-}
-
-/// LED-related target tokens for command parsing.
-///
-/// # Details
-/// Provides methods to parse user utterances, generate UART payloads,
-/// create confirmation messages, and define acknowledgment patterns.
-impl DeviceCommand {
-    /// Parses user text to extract LED control commands.
-    ///
-    /// # Details
-    /// Tokenizes the input, checks for LED-related keywords ("led", "light", etc.),
-    /// and detects intent words like "on", "enable", "off", or "disable". When
-    /// `allow_pronoun_reference` is true, pronouns like "it" are also accepted as
-    /// valid LED targets.
-    ///
-    /// # Arguments
-    /// * `text` - The user's utterance to parse.
-    /// * `allow_pronoun_reference` - Whether to allow pronouns as LED references.
-    ///
-    /// # Returns
-    /// * `Option<Self>` - `Some(DeviceCommand)` if a valid LED command is detected,
-    ///   `None` otherwise.
-    fn from_text(text: &str, allow_pronoun_reference: bool) -> Option<Self> {
-        let normalized = text.to_lowercase();
-        let tokens: Vec<&str> = normalized
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|token| !token.is_empty())
-            .collect();
-        let mentions_target = tokens.iter().any(|token| LED_TARGET_TOKENS.contains(token))
-            || (allow_pronoun_reference
-                && tokens
-                    .iter()
-                    .any(|token| LED_PRONOUN_TOKENS.contains(token)));
-        if !mentions_target {
-            return None;
-        }
-        let wants_on = tokens.iter().any(|token| {
-            matches!(
-                *token,
-                "on" | "enable" | "start" | "activate" | "high" | "set"
-            )
-        });
-        let wants_off = tokens.iter().any(|token| {
-            matches!(
-                *token,
-                "off" | "disable" | "stop" | "deactivate" | "low" | "clear"
-            )
-        });
-        match (wants_on, wants_off) {
-            (true, false) => Some(Self::LedOn),
-            (false, true) => Some(Self::LedOff),
-            _ => None,
-        }
-    }
-
-    /// Returns the UART payload bytes for this command.
-    ///
-    /// # Details
-    /// Provides the exact byte sequence to transmit over the serial port
-    /// for the corresponding LED command.
-    ///
-    /// # Arguments
-    /// None.
-    ///
-    /// # Returns
-    /// * `&'static [u8]` - The command bytes ("ON" or "OFF").
-    fn serial_bytes(self) -> &'static [u8] {
-        match self {
-            Self::LedOn => b"ON",
-            Self::LedOff => b"OFF",
-        }
-    }
-
-    /// Returns the spoken confirmation message for this command.
-    ///
-    /// # Details
-    /// Provides the text that the assistant will speak when the command
-    /// is successfully sent to the Pico.
-    ///
-    /// # Arguments
-    /// None.
-    ///
-    /// # Returns
-    /// * `&'static str` - The confirmation message to be spoken.
-    fn success_message(self) -> &'static str {
-        match self {
-            Self::LedOn => "Turning the Pico LED on.",
-            Self::LedOff => "Turning the Pico LED off.",
-        }
-    }
-
-    /// Returns a human-readable label for this command.
-    ///
-    /// # Details
-    /// Provides a string representation used for logging and debugging,
-    /// such as "LED ON" or "LED OFF".
-    ///
-    /// # Arguments
-    /// None.
-    ///
-    /// # Returns
-    /// * `&'static str` - The command label for display purposes.
-    fn label(self) -> &'static str {
-        match self {
-            Self::LedOn => "LED ON",
-            Self::LedOff => "LED OFF",
-        }
-    }
-
-    /// Returns the expected acknowledgment tokens from the Pico.
-    ///
-    /// # Details
-    /// Provides the list of lowercase strings to look for in the UART response
-    /// to confirm the command was received and executed by the microcontroller.
-    ///
-    /// # Arguments
-    /// None.
-    ///
-    /// # Returns
-    /// * `&'static [&'static str]` - Array of valid acknowledgment strings.
-    fn ack_tokens(self) -> &'static [&'static str] {
-        match self {
-            Self::LedOn => LED_ON_ACK_TOKENS,
-            Self::LedOff => LED_OFF_ACK_TOKENS,
-        }
-    }
-}
-
 /// Implementation of UART device command methods.
 ///
 /// # Details
 /// Provides methods for sending commands to the Raspberry Pi Pico over serial,
 /// handling acknowledgments, and managing the serial port lifecycle.
 impl VoiceAssistantRuntime {
-    /// Sends a command to the Pico over UART with acknowledgment and retry logic.
+    /// Sends a raw UART command string to the Pico.
     ///
     /// # Details
-    /// Attempts to write the command payload to the serial port and waits for
-    /// acknowledgment from the Pico. Retries once if the first attempt fails or
-    /// times out. The serial port is reopened between retries.
+    /// Writes the command string as bytes to the serial port without acknowledgment checking.
+    /// Used for extensible commands loaded from commands.json.
     ///
     /// # Arguments
-    /// * `command` - The LED command to execute on the Pico.
+    /// * `command` - The command string to send.
     ///
     /// # Returns
-    /// * `Ok(())` - Command was acknowledged by the Pico.
+    /// * `Ok(())` - Command was sent successfully.
     ///
     /// # Errors
-    /// Returns an error if both attempts fail to receive acknowledgment.
-    fn send_device_command(&mut self, command: DeviceCommand) -> Result<()> {
-        let payload = command.serial_bytes();
-        match self.try_command_with_retry(command, payload) {
-            Ok(_) => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Attempts a command with one retry on failure.
-    ///
-    /// # Details
-    /// Tries sending the UART command twice, reopening the port between retries.
-    ///
-    /// # Arguments
-    /// * `command` - The device command to execute.
-    /// * `payload` - The raw bytes to transmit.
-    ///
-    /// # Returns
-    /// * `Ok(())` - Command was acknowledged.
-    ///
-    /// # Errors
-    /// Returns an error if both attempts fail to receive acknowledgment.
-    fn try_command_with_retry(&mut self, command: DeviceCommand, payload: &[u8]) -> Result<()> {
-        for attempt in 0..2 {
-            if self.try_single_command_attempt(command, payload, attempt)? {
-                return Ok(());
-            }
-        }
-        anyhow::bail!(
-            "UART did not acknowledge command {} even after retries",
-            command.label()
-        )
-    }
-
-    /// Executes one command attempt.
-    ///
-    /// # Details
-    /// Writes the payload to UART and waits for acknowledgment from the Pico.
-    ///
-    /// # Arguments
-    /// * `command` - The device command being sent.
-    /// * `payload` - The raw command bytes.
-    /// * `attempt` - The attempt number for logging.
-    ///
-    /// # Returns
-    /// * `Ok(true)` - Command acknowledged.
-    /// * `Ok(false)` - No acknowledgment received.
-    ///
-    /// # Errors
-    /// Returns an error if UART write fails.
-    fn try_single_command_attempt(
-        &mut self,
-        command: DeviceCommand,
-        payload: &[u8],
-        attempt: usize,
-    ) -> Result<bool> {
-        let path = self.serial_path.clone();
-        match self.write_uart_payload(payload) {
-            Ok(_) => {
-                eprintln!(
-                    "[UART send] {} -> {} (attempt {})",
-                    path,
-                    command.label(),
-                    attempt + 1
-                );
-                if self.await_command_ack(command)? {
-                    Ok(true)
-                } else {
-                    eprintln!(
-                        "UART ack missing for {} on {}, retrying",
-                        command.label(),
-                        path
-                    );
-                    self.serial = None;
-                    Ok(false)
-                }
-            }
-            Err(err) => {
-                eprintln!("UART write error on {}: {}", path, err);
-                self.serial = None;
-                Err(err)
-            }
-        }
-    }
-
-    /// Writes a command payload to the UART with proper framing.
-    ///
-    /// # Details
-    /// Ensures the serial port is open, drains any pending input, writes the
-    /// payload bytes followed by a newline, and flushes the output buffer.
-    /// Includes a delay after transmission to prevent command overlap.
-    ///
-    /// # Arguments
-    /// * `payload` - The command bytes to transmit.
-    ///
-    /// # Returns
-    /// * `Ok(())` - Payload was written and flushed successfully.
-    ///
-    /// # Errors
-    /// Returns an error if the serial port cannot be opened or write operations fail.
-    fn write_uart_payload(&mut self, payload: &[u8]) -> Result<()> {
-        let path = self.serial_path.clone();
-        let port = self.ensure_serial_port()?;
-        drain_serial_input(port);
-        Self::send_payload_bytes(port, payload, &path)?;
+    /// Returns an error if serial write fails or port cannot be opened.
+    fn send_raw_uart_command(&mut self, command: &str) -> Result<()> {
+        eprintln!("→ Sending {} to Pico", command);
+        self.ensure_serial_port()?;
+        let payload = command.as_bytes();
+        self.serial
+            .as_mut()
+            .unwrap()
+            .write_all(payload)
+            .with_context(|| "Failed to write to serial port")?;
+        self.serial.as_mut().unwrap().write_all(b"\n")?;
+        self.serial.as_mut().unwrap().flush()?;
         std::thread::sleep(SERIAL_COMMAND_DELAY);
+        eprintln!("✓ Command sent");
         Ok(())
-    }
-
-    /// Sends payload bytes with newline and flush.
-    ///
-    /// # Details
-    /// Writes the command bytes, appends newline framing, and flushes the buffer.
-    ///
-    /// # Arguments
-    /// * `port` - The serial port to write to.
-    /// * `payload` - The command bytes to transmit.
-    /// * `path` - The device path for error messages.
-    ///
-    /// # Returns
-    /// * `Ok(())` - Payload successfully sent and flushed.
-    ///
-    /// # Errors
-    /// Returns an error if write or flush operations fail.
-    fn send_payload_bytes(port: &mut dyn SerialPort, payload: &[u8], path: &str) -> Result<()> {
-        port.write_all(payload)
-            .with_context(|| format!("Failed to write to {}", path))?;
-        port.write_all(b"\n")
-            .with_context(|| format!("Failed to send newline to {}", path))?;
-        port.flush()
-            .with_context(|| format!("Failed to flush {}", path))
-    }
-
-    /// Waits for acknowledgment from the Pico after sending a command.
-    ///
-    /// # Details
-    /// Polls the serial port for incoming data until the acknowledgment timeout
-    /// expires. Accumulates received text and checks for command-specific
-    /// acknowledgment tokens (e.g., "LED ON", "LED OFF").
-    ///
-    /// # Arguments
-    /// * `command` - The command for which acknowledgment is expected.
-    ///
-    /// # Returns
-    /// * `Ok(true)` - Valid acknowledgment received.
-    /// * `Ok(false)` - Timeout expired without acknowledgment.
-    ///
-    /// # Errors
-    /// Returns an error only for unexpected I/O failures (not timeout).
-    fn await_command_ack(&mut self, command: DeviceCommand) -> Result<bool> {
-        let deadline = Instant::now() + SERIAL_ACK_TIMEOUT;
-        let port = self.ensure_serial_port()?;
-        Self::poll_for_ack(port, command, deadline)
-    }
-
-    /// Polls the serial port until acknowledgment or timeout.
-    ///
-    /// # Details
-    /// Reads from the serial port repeatedly until timeout or valid ack is found.
-    ///
-    /// # Arguments
-    /// * `port` - The serial port to read from.
-    /// * `command` - The command to match acknowledgment against.
-    /// * `deadline` - The absolute time when polling should stop.
-    ///
-    /// # Returns
-    /// * `Ok(true)` - Valid acknowledgment received.
-    /// * `Ok(false)` - Timeout expired without acknowledgment.
-    ///
-    /// # Errors
-    /// Returns an error for unexpected I/O failures.
-    fn poll_for_ack(
-        port: &mut dyn SerialPort,
-        command: DeviceCommand,
-        deadline: Instant,
-    ) -> Result<bool> {
-        let mut scratch = [0_u8; SERIAL_READ_CHUNK];
-        let mut transcript = String::new();
-        while Instant::now() < deadline {
-            if Self::process_serial_read(port, &mut scratch, &mut transcript, command)? {
-                return Ok(true);
-            }
-            std::thread::sleep(SERIAL_ACK_SLEEP);
-        }
-        Ok(false)
-    }
-
-    /// Processes one serial read attempt.
-    ///
-    /// # Details
-    /// Reads from the port, accumulates data, and checks for acknowledgment tokens.
-    ///
-    /// # Arguments
-    /// * `port` - The serial port to read from.
-    /// * `scratch` - The temporary read buffer.
-    /// * `transcript` - The accumulated text buffer.
-    /// * `command` - The command to check acknowledgment against.
-    ///
-    /// # Returns
-    /// * `Ok(true)` - Acknowledgment found.
-    /// * `Ok(false)` - No acknowledgment yet, continue polling.
-    ///
-    /// # Errors
-    /// Returns an error for unexpected I/O failures.
-    fn process_serial_read(
-        port: &mut dyn SerialPort,
-        scratch: &mut [u8],
-        transcript: &mut String,
-        command: DeviceCommand,
-    ) -> Result<bool> {
-        match port.read(scratch) {
-            Ok(0) => Ok(false),
-            Ok(n) => {
-                let raw = String::from_utf8_lossy(&scratch[..n]).replace('\r', "");
-                if !raw.trim().is_empty() {
-                    eprintln!("[UART ack] {}", raw.trim());
-                }
-                transcript.push_str(&raw.to_lowercase());
-                Ok(command
-                    .ack_tokens()
-                    .iter()
-                    .any(|token| transcript.contains(token)))
-            }
-            Err(err) => match err.kind() {
-                ErrorKind::WouldBlock | ErrorKind::TimedOut => Ok(false),
-                _ => {
-                    eprintln!("UART ack error: {}", err);
-                    Ok(false)
-                }
-            },
-        }
     }
 
     /// Opens the serial port if not already connected, with fallback to callout variant.
@@ -1722,34 +1364,7 @@ impl VoiceAssistantRuntime {
     }
 }
 
-/// Drains any pending data from the serial port input buffer.
-///
-/// # Details
-/// Repeatedly reads from the port until no more data is available or a timeout
-/// occurs. This prevents stale acknowledgments from previous commands from
-/// interfering with the current operation.
-///
-/// # Arguments
-/// * `port` - Mutable reference to the serial port to drain.
-///
-/// # Returns
-/// * `()` - Returns nothing; errors are logged but not propagated.
-fn drain_serial_input(port: &mut dyn SerialPort) {
-    let mut buffer = [0_u8; SERIAL_READ_CHUNK];
-    loop {
-        match port.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(err) => match err.kind() {
-                ErrorKind::WouldBlock | ErrorKind::TimedOut => break,
-                _ => {
-                    eprintln!("UART drain error: {}", err);
-                    break;
-                }
-            },
-        }
-    }
-}
+
 
 /// Determines the serial port path from environment variable or configuration.
 ///
@@ -2000,27 +1615,5 @@ mod tests {
         assert!(!VoiceAssistantRuntime::contains_speech(&[0_i16; 1600]));
         let loud = vec![i16::MAX / 2; 1600];
         assert!(VoiceAssistantRuntime::contains_speech(&loud));
-    }
-
-    #[test]
-    fn device_command_classification() {
-        assert_eq!(
-            DeviceCommand::from_text("please turn the LED on", false),
-            Some(DeviceCommand::LedOn)
-        );
-        assert_eq!(
-            DeviceCommand::from_text("could you disable the light", false),
-            Some(DeviceCommand::LedOff)
-        );
-        assert_eq!(DeviceCommand::from_text("tell me a joke", false), None);
-        assert_eq!(
-            DeviceCommand::from_text("can you turn it on", false),
-            None,
-            "pronoun commands require LED context"
-        );
-        assert_eq!(
-            DeviceCommand::from_text("turn it off", true),
-            Some(DeviceCommand::LedOff)
-        );
     }
 }

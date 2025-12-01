@@ -48,4 +48,5 @@
 
 pub mod assistant;
 pub mod audio;
+pub mod commands;
 pub mod speech;
