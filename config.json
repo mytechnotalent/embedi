@@ -1,6 +1,6 @@
 {
     "default_serial_port": "/dev/cu.usbmodem1402",
-    "default_ollama_model": "llama3.3:70b",
+    "default_ollama_model": "qwen2.5:32b",
     "_comment_default": "llama3.2:3b - Fast and efficient 3B parameter model, ideal for resource-constrained systems",
     "_comment_powerful": "For more powerful inference, use: qwen2.5:32b or llama3.3:70b"
 }
