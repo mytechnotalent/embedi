@@ -6,7 +6,7 @@
 
 # Embedi
 
-Embedi — hands‑free open‑source embedded AI: speech capture, local Whisper transcription, Ollama LLM chat, macOS TTS, and UART control for Pico robotics.
+Embedi — hands‑free open‑source embedded AI: speech capture, local Whisper transcription, Ollama LLM chat, macOS TTS, and UART control for Raspberry Pi Pico 2 robotics.
 
 <br>
 
