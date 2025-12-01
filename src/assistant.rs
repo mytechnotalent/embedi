@@ -381,13 +381,12 @@ impl VoiceAssistantRuntime {
             Self::download_whisper_model()?;
         }
 
-        WhisperContext::new_with_params(
-            WHISPER_MODEL_PATH,
-            whisper_rs::WhisperContextParameters::default(),
-        )
-        .with_context(|| "Failed to initialize Whisper")
-    }
+        let mut params = whisper_rs::WhisperContextParameters::default();
+        params.use_gpu(false);
 
+        WhisperContext::new_with_params(WHISPER_MODEL_PATH, params)
+            .with_context(|| "Failed to initialize Whisper")
+    }
     fn download_whisper_model() -> Result<()> {
         const MODEL_URL: &str =
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
