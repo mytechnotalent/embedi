@@ -1,6 +1,6 @@
 /*
- * @file config.rs
- * @brief Application configuration constants
+ * @file filter.rs
+ * @brief ASCII character validation
  * @author Kevin Thomas
  * @date 2025
  *
@@ -27,25 +27,66 @@
  * SOFTWARE.
  */
 
-//! FILE: config.rs
+//! FILE: filter.rs
 //!
 //! DESCRIPTION:
-//! RP2350 UART Configuration Constants.
+//! RP2350 ASCII Character Validation.
 //!
 //! BRIEF:
-//! Defines configuration constants for UART communication.
-//! Contains baud rate and other communication parameters.
+//! Validates incoming bytes as printable ASCII characters.
+//! Filters control characters and non-printable bytes.
 //!
 //! AUTHOR: Kevin Thomas
 //! CREATION DATE: November 30, 2025
 //! UPDATE DATE: November 30, 2025
 
-/// UART baud rate constant.
+/// Minimum printable ASCII value (space character).
+const PRINTABLE_MIN: u8 = 32;
+
+/// Maximum printable ASCII value (tilde character).
+const PRINTABLE_MAX: u8 = 126;
+
+/// Checks if byte is printable ASCII character.
 ///
 /// # Details
-/// Configures UART communication speed at 115200 bits per second.
-/// Standard baud rate for serial communication.
+/// Validates byte falls within printable ASCII range (32-126).
+/// Rejects control characters and extended ASCII.
 ///
-/// # Value
-/// 115200 baud
-pub const UART_BAUD: u32 = 115200;
+/// # Arguments
+/// * `byte` - Byte to validate
+///
+/// # Returns
+/// * `bool` - true if printable, false otherwise
+pub fn is_printable(byte: u8) -> bool {
+    (PRINTABLE_MIN..=PRINTABLE_MAX).contains(&byte)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_printable_space() {
+        assert!(is_printable(b' '));
+    }
+
+    #[test]
+    fn test_printable_letter() {
+        assert!(is_printable(b'A'));
+    }
+
+    #[test]
+    fn test_printable_tilde() {
+        assert!(is_printable(b'~'));
+    }
+
+    #[test]
+    fn test_non_printable_null() {
+        assert!(!is_printable(0));
+    }
+
+    #[test]
+    fn test_non_printable_del() {
+        assert!(!is_printable(127));
+    }
+}

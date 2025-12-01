@@ -1,6 +1,6 @@
 /*
- * @file bootinfo.rs
- * @brief Boot and tooling metadata for the RP2350 firmware
+ * @file lib.rs
+ * @brief Library module exports
  * @author Kevin Thomas
  * @date 2025
  *
@@ -27,11 +27,23 @@
  * SOFTWARE.
  */
 
-#[cfg(rp2350)]
-use crate::hal;
+//! FILE: lib.rs
+//!
+//! DESCRIPTION:
+//! RP2350 Library Module Exports.
+//!
+//! BRIEF:
+//! Exports all public modules for testing and reuse.
+//! Conditionally enables std for host testing.
+//!
+//! AUTHOR: Kevin Thomas
+//! CREATION DATE: November 30, 2025
+//! UPDATE DATE: November 30, 2025
 
-/// Tell the Boot ROM about our application
-#[unsafe(link_section = ".start_block")]
-#[used]
-#[cfg(rp2350)]
-pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
+#![cfg_attr(not(test), no_std)]
+
+pub mod config;
+pub mod detection;
+pub mod detector;
+pub mod filter;
+pub mod process;

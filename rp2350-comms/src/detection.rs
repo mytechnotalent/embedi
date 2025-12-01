@@ -1,6 +1,6 @@
 /*
- * @file config.rs
- * @brief Application configuration constants
+ * @file detection.rs
+ * @brief Detection result handler
  * @author Kevin Thomas
  * @date 2025
  *
@@ -27,25 +27,47 @@
  * SOFTWARE.
  */
 
-//! FILE: config.rs
+//! FILE: detection.rs
 //!
 //! DESCRIPTION:
-//! RP2350 UART Configuration Constants.
+//! RP2350 Detection Result Handler.
 //!
 //! BRIEF:
-//! Defines configuration constants for UART communication.
-//! Contains baud rate and other communication parameters.
+//! Converts Detection enum to boolean LED state.
+//! Handles ON/OFF detection results for GPIO control.
 //!
 //! AUTHOR: Kevin Thomas
 //! CREATION DATE: November 30, 2025
 //! UPDATE DATE: November 30, 2025
 
-/// UART baud rate constant.
+use crate::detector::Detection;
+
+/// Handles detection result and converts to boolean.
 ///
 /// # Details
-/// Configures UART communication speed at 115200 bits per second.
-/// Standard baud rate for serial communication.
+/// Converts Detection enum variant to boolean value for LED control.
+/// Returns true for Detection::On, false for Detection::Off.
 ///
-/// # Value
-/// 115200 baud
-pub const UART_BAUD: u32 = 115200;
+/// # Arguments
+/// * `det` - Detection enum variant (On or Off)
+///
+/// # Returns
+/// * `bool` - true if On, false if Off
+pub fn handle_detection(det: Detection) -> bool {
+    matches!(det, Detection::On)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_detection_on() {
+        assert!(handle_detection(Detection::On));
+    }
+
+    #[test]
+    fn test_handle_detection_off() {
+        assert!(!handle_detection(Detection::Off));
+    }
+}
