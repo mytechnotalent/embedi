@@ -27,18 +27,10 @@
  * SOFTWARE.
  */
 
-//! FILE: main.rs
+//! RP2350 embedded application entry point.
 //!
-//! DESCRIPTION:
-//! RP2350 Embedded Rust Embassy UART Control Application.
-//!
-//! BRIEF:
-//! Main application entry point for RP2350 UART-controlled LED using Embassy.
-//! Reads UART input and controls GPIO16 LED based on ON/OFF keywords.
-//!
-//! AUTHOR: Kevin Thomas
-//! CREATION DATE: November 30, 2025
-//! UPDATE DATE: November 30, 2025
+//! This module contains only the main entry point which initializes
+//! the hardware and delegates to the runtime module.
 
 #![no_std]
 #![no_main]
@@ -47,68 +39,25 @@ mod config;
 mod detection;
 mod detector;
 mod filter;
+mod hardware;
 mod process;
 
-use config::UART_BAUD;
-use detection::handle_detection;
-use detector::Detector;
 use embassy_executor::Spawner;
-use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::UART0;
-use embassy_rp::uart::{Config, InterruptHandler, Uart};
+use hardware::run_application;
 use panic_halt as _;
-use process::process_byte;
-
-// Binds UART0 interrupt to handler.
-bind_interrupts!(struct Irqs {
-    UART0_IRQ => InterruptHandler<UART0>;
-});
 
 /// Main application entry point.
 ///
 /// # Details
-/// Initializes UART and LED, then runs infinite loop reading UART.
-/// When "ON" is detected, LED turns on. When "OFF" is detected, LED turns off.
+/// Initializes Embassy runtime and spawns the main application task.
+/// Hardware initialization and event loop are delegated to runtime module.
 ///
 /// # Arguments
-/// * `_spawner` - Embassy task spawner (unused)
+/// * `spawner` - Embassy task spawner for async execution.
 ///
 /// # Returns
-/// Never returns (infinite loop)
+/// * `()` - Never returns (infinite loop in runtime).
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
-    let mut led = Output::new(p.PIN_16, Level::Low);
-
-    let mut config = Config::default();
-    config.baudrate = UART_BAUD;
-    let mut uart = Uart::new(
-        p.UART0, p.PIN_0, p.PIN_1, Irqs, p.DMA_CH0, p.DMA_CH1, config,
-    );
-
-    let _ = uart.write(b"READY\r\n").await;
-    run_loop(&mut uart, &mut led).await;
-}
-
-/// Runs main event loop
-async fn run_loop(
-    uart: &mut Uart<'static, embassy_rp::uart::Async>,
-    led: &mut Output<'static>,
-) -> ! {
-    let mut detector = Detector::new();
-    let mut buf = [0u8; 1];
-    loop {
-        if uart.read(&mut buf).await.is_ok() {
-            if let Some(det) = process_byte(buf[0], &mut detector) {
-                if handle_detection(det) {
-                    led.set_high();
-                    let _ = uart.write(b"LED ON\r\n").await;
-                } else {
-                    led.set_low();
-                    let _ = uart.write(b"LED OFF\r\n").await;
-                }
-            }
-        }
-    }
+async fn main(spawner: Spawner) {
+    run_application(spawner).await;
 }

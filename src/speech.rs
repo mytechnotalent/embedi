@@ -34,14 +34,19 @@ use std::sync::Mutex;
 
 /// Speaks the given text using macOS `say` command.
 ///
-/// # Parameters
+/// # Details
+/// Validates that text is non-empty and delegates to run_say for actual
+/// synthesis. The macOS say command uses the system's default voice.
+///
+/// # Arguments
 /// * `text` - The utterance to synthesize.
 ///
 /// # Returns
-/// `Ok(())` when the `say` command completes successfully.
+/// * `Ok(())` - When the say command completes successfully.
 ///
 /// # Errors
-/// Returns an error if the `say` command fails to spawn or exits unexpectedly.
+/// Returns an error if the say command fails to spawn or exits unexpectedly,
+/// or if the input text is empty or whitespace-only.
 pub fn speak(text: &str) -> Result<()> {
     if text.trim().is_empty() {
         anyhow::bail!("Cannot speak empty text");
@@ -50,6 +55,20 @@ pub fn speak(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Executes the macOS say command or returns a mock result in tests.
+///
+/// # Details
+/// In test mode, checks the FORCE_ERROR flag to simulate failures.
+/// In production, spawns the say command and waits for completion.
+///
+/// # Arguments
+/// * `text` - The text to pass to the say command.
+///
+/// # Returns
+/// * `Ok(())` - When the command executes successfully.
+///
+/// # Errors
+/// Returns an error if command spawning fails or FORCE_ERROR is set in tests.
 fn run_say(text: &str) -> Result<()> {
     if cfg!(test) {
         if *FORCE_ERROR.lock().unwrap() {

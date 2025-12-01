@@ -37,6 +37,7 @@ use embedi::assistant;
 /// Bootstraps environment variables and launches the asynchronous voice
 /// assistant loop.
 async fn main() -> Result<()> {
+    // Load environment variables from .env file
     dotenv::dotenv().ok();
 
     // Set up Ctrl+C handler to clean up temp files

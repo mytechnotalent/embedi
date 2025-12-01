@@ -29,19 +29,17 @@
 
 //! Voice assistant orchestration module.
 
+use crate::audio::{record_audio, save_wav};
+use crate::speech::speak;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serialport::SerialPort;
 use std::{
     env, fs,
     io::ErrorKind,
     path::Path,
     time::{Duration, Instant},
 };
-
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use serialport::SerialPort;
-
-use crate::audio::{record_audio, save_wav};
-use crate::speech::speak;
 
 /// Temporary file used for passing audio samples to Whisper.
 ///
@@ -75,9 +73,6 @@ const DEFAULT_SERIAL_BAUD: u32 = 115_200;
 
 /// Ollama API endpoint for local LLM inference.
 const OLLAMA_API_URL: &str = "http://localhost:11434/api/chat";
-
-/// Default Ollama model to use.
-const DEFAULT_OLLAMA_MODEL: &str = "llama3.2:3b";
 
 /// Whisper model path (will be auto-downloaded if not present).
 const WHISPER_MODEL_PATH: &str = "models/ggml-base.en.bin";
@@ -117,13 +112,19 @@ const LED_OFF_ACK_TOKENS: &[&str] = &["led off", "led: off"];
 struct AppConfig {
     #[serde(default = "fallback_serial_port")]
     default_serial_port: String,
+    #[serde(default = "fallback_ollama_model")]
+    default_ollama_model: String,
 }
 
 /// Returns the fallback serial port path.
+///
+/// # Details
+/// Provides default configuration values when config.json is missing or invalid.
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             default_serial_port: fallback_serial_port(),
+            default_ollama_model: fallback_ollama_model(),
         }
     }
 }
@@ -151,6 +152,10 @@ pub fn cleanup_temp_files() {
 }
 
 /// Runtime container that owns the HTTP client and conversation state.
+///
+/// # Details
+/// Maintains the Ollama client, Whisper context, chat history, serial port
+/// connection, and memory log across the entire voice assistant session.
 struct VoiceAssistantRuntime {
     client: reqwest::Client,
     ollama_model: String,
@@ -164,6 +169,10 @@ struct VoiceAssistantRuntime {
 }
 
 /// Chat message structure for Ollama API.
+///
+/// # Details
+/// Represents a single message in the conversation history, containing
+/// the role (user, assistant, or system) and the message content.
 #[derive(Clone, Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
@@ -171,6 +180,10 @@ struct ChatMessage {
 }
 
 /// Request structure for Ollama API.
+///
+/// # Details
+/// Encapsulates the model name, conversation history, and streaming preference
+/// for Ollama chat completion requests.
 #[derive(Serialize)]
 struct OllamaRequest {
     model: String,
@@ -179,12 +192,21 @@ struct OllamaRequest {
 }
 
 /// Response structure for Ollama API.
+///
+/// # Details
+/// Contains the assistant's generated message returned by Ollama's
+/// chat completion endpoint.
 #[derive(Deserialize)]
 struct OllamaResponse {
     message: ChatMessage,
 }
 
 /// Represents a single memory entry in persistent storage.
+/// Implementation of core voice assistant runtime methods.
+///
+/// # Details
+/// Provides methods for initializing the runtime, managing the conversation loop,
+/// transcribing audio, querying the LLM, and controlling connected devices.
 impl VoiceAssistantRuntime {
     /// Creates a new runtime by loading configuration.
     ///
@@ -194,26 +216,13 @@ impl VoiceAssistantRuntime {
     /// # Errors
     /// Propagates failures from initialization.
     fn new() -> Result<Self> {
-        let memory_entries = match load_memory_entries() {
-            Ok(entries) => entries,
-            Err(err) => {
-                eprintln!("Memory load error: {}", err);
-                Vec::new()
-            }
-        };
-        let mut history = Vec::new();
-        for entry in &memory_entries {
-            history.push(ChatMessage {
-                role: match entry.role {
-                    MemoryRole::User => "user".to_string(),
-                    MemoryRole::Assistant => "assistant".to_string(),
-                },
-                content: entry.text.clone(),
-            });
-        }
+        // Ensure Ollama is ready before proceeding
+        Self::ensure_ollama_ready()?;
+        let memory_entries = Self::load_memory_with_fallback();
+        let history = Self::build_chat_history(&memory_entries);
         let config = load_app_config();
         let ollama_model =
-            env::var("OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
+            env::var("OLLAMA_MODEL").unwrap_or_else(|_| config.default_ollama_model.clone());
         Ok(Self {
             client: reqwest::Client::new(),
             ollama_model,
@@ -225,6 +234,245 @@ impl VoiceAssistantRuntime {
             memory: memory_entries,
             led_context_active: false,
         })
+    }
+
+    /// Loads memory entries from disk with error handling and fallback.
+    ///
+    /// # Details
+    /// Attempts to load the conversation history from the persistent memory file.
+    /// If loading fails (file doesn't exist, is corrupted, etc.), logs the error
+    /// and returns an empty vector to allow the application to start fresh.
+    ///
+    /// # Arguments
+    /// None.
+    ///
+    /// # Returns
+    /// * `Vec<MemoryEntry>` - Loaded memory entries, or empty vector on failure.
+    fn load_memory_with_fallback() -> Vec<MemoryEntry> {
+        match load_memory_entries() {
+            Ok(entries) => entries,
+            Err(err) => {
+                eprintln!("Memory load error: {}", err);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Converts memory entries into chat messages for LLM context.
+    ///
+    /// # Details
+    /// Transforms the persistent memory format into the chat message structure
+    /// required by the Ollama API. This preserves conversation history across
+    /// application restarts.
+    ///
+    /// # Arguments
+    /// * `memory_entries` - The memory entries to convert.
+    ///
+    /// # Returns
+    /// * `Vec<ChatMessage>` - Formatted chat messages ready for LLM consumption.
+    fn build_chat_history(memory_entries: &[MemoryEntry]) -> Vec<ChatMessage> {
+        memory_entries
+            .iter()
+            .map(|entry| ChatMessage {
+                role: match entry.role {
+                    MemoryRole::User => "user".to_string(),
+                    MemoryRole::Assistant => "assistant".to_string(),
+                },
+                content: entry.text.clone(),
+            })
+            .collect()
+    }
+
+    /// Ensures Ollama service is running and required model is available.
+    ///
+    /// # Details
+    /// Checks if Ollama is responding on localhost:11434. If not, attempts to start
+    /// the service. Then verifies the required model is available and downloads it
+    /// if missing. This makes the application self-sufficient and easier for others
+    /// to run without manual setup.
+    ///
+    /// # Arguments
+    /// None.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Ollama is running and the model is available.
+    ///
+    /// # Errors
+    /// Returns an error if Ollama cannot be started or the model cannot be downloaded.
+    fn ensure_ollama_ready() -> Result<()> {
+        let config = load_app_config();
+        let model =
+            env::var("OLLAMA_MODEL").unwrap_or_else(|_| config.default_ollama_model.clone());
+        Self::ensure_ollama_service()?;
+        Self::ensure_ollama_model(&model)?;
+        Ok(())
+    }
+
+    /// Ensures the Ollama service is running, starting it if necessary.
+    ///
+    /// # Details
+    /// Checks if Ollama is responding on localhost:11434. If not, attempts to start
+    /// the service and waits for it to initialize. This allows the application to
+    /// automatically recover from a stopped Ollama service without user intervention.
+    ///
+    /// # Arguments
+    /// None.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Ollama service is running and responding.
+    ///
+    /// # Errors
+    /// Returns an error if Ollama cannot be started or is not installed.
+    fn ensure_ollama_service() -> Result<()> {
+        eprintln!("Checking Ollama service...");
+        if !Self::is_ollama_running() {
+            eprintln!("Ollama not running, attempting to start...");
+            Self::start_ollama_service()?;
+            std::thread::sleep(Duration::from_secs(3));
+            if !Self::is_ollama_running() {
+                anyhow::bail!(
+                    "Failed to start Ollama service. Please install Ollama from https://ollama.ai"
+                );
+            }
+        }
+        eprintln!("✓ Ollama service is running");
+        Ok(())
+    }
+
+    /// Ensures the specified Ollama model is available, downloading if necessary.
+    ///
+    /// # Details
+    /// Queries the Ollama API to check if the model is already installed. If not,
+    /// initiates a download using the Ollama CLI. The download may take several
+    /// minutes depending on model size and network speed.
+    ///
+    /// # Arguments
+    /// * `model` - The name of the model to ensure is available (e.g., "llama3.2:3b").
+    ///
+    /// # Returns
+    /// * `Ok(())` - Model is available or was successfully downloaded.
+    ///
+    /// # Errors
+    /// Returns an error if the model query fails or download is unsuccessful.
+    fn ensure_ollama_model(model: &str) -> Result<()> {
+        eprintln!("Checking for model {}...", model);
+        if !Self::has_ollama_model(model)? {
+            eprintln!("Model {} not found, downloading...", model);
+            eprintln!("This may take several minutes depending on your connection.");
+            Self::pull_ollama_model(model)?;
+        }
+        eprintln!("✓ Model {} is ready", model);
+        Ok(())
+    }
+
+    /// Checks if Ollama service is responding.
+    ///
+    /// # Details
+    /// Attempts a simple HTTP GET to the Ollama API tags endpoint with a short timeout.
+    ///
+    /// # Arguments
+    /// None.
+    ///
+    /// # Returns
+    /// * `bool` - `true` if Ollama responds, `false` otherwise.
+    fn is_ollama_running() -> bool {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        client.get("http://localhost:11434/api/tags").send().is_ok()
+    }
+
+    /// Attempts to start the Ollama service in the background.
+    ///
+    /// # Details
+    /// First kills any existing Ollama processes to prevent multiple instances,
+    /// then spawns `ollama serve` as a detached background process.
+    ///
+    /// # Arguments
+    /// None.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Command was spawned successfully.
+    ///
+    /// # Errors
+    /// Returns an error if the ollama executable cannot be found or spawned.
+    fn start_ollama_service() -> Result<()> {
+        let _ = std::process::Command::new("pkill")
+            .arg("-9")
+            .arg("ollama")
+            .output();
+        std::thread::sleep(Duration::from_millis(500));
+        std::process::Command::new("ollama")
+            .arg("serve")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .with_context(|| "Failed to start Ollama. Please install from https://ollama.ai")?;
+        Ok(())
+    }
+
+    /// Checks if a specific model is available in Ollama.
+    ///
+    /// # Details
+    /// Queries the Ollama API for the list of installed models and checks
+    /// if the specified model is present.
+    ///
+    /// # Arguments
+    /// * `model_name` - The name of the model to check (e.g., "llama3.2:3b").
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Model is available.
+    /// * `Ok(false)` - Model is not available.
+    ///
+    /// # Errors
+    /// Returns an error if the API request fails.
+    fn has_ollama_model(model_name: &str) -> Result<bool> {
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .get("http://localhost:11434/api/tags")
+            .send()
+            .with_context(|| "Failed to query Ollama models")?;
+        let json: serde_json::Value = response
+            .json()
+            .with_context(|| "Failed to parse Ollama response")?;
+        if let Some(models) = json["models"].as_array() {
+            for model in models {
+                if let Some(name) = model["name"].as_str() {
+                    if name == model_name {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Downloads a model using the Ollama CLI.
+    ///
+    /// # Details
+    /// Executes `ollama pull <model>` and waits for completion. Output is shown
+    /// to the user so they can track download progress.
+    ///
+    /// # Arguments
+    /// * `model_name` - The name of the model to download.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Model was downloaded successfully.
+    ///
+    /// # Errors
+    /// Returns an error if the pull command fails or times out.
+    fn pull_ollama_model(model_name: &str) -> Result<()> {
+        let status = std::process::Command::new("ollama")
+            .arg("pull")
+            .arg(model_name)
+            .status()
+            .with_context(|| "Failed to execute ollama pull")?;
+        if !status.success() {
+            anyhow::bail!("Failed to download model {}", model_name);
+        }
+        Ok(())
     }
 
     /// Continuously runs the assistant until a quit phrase is detected.
@@ -414,7 +662,6 @@ impl VoiceAssistantRuntime {
         params.set_print_progress(false);
         params.set_print_special(false);
         params.set_print_realtime(false);
-
         let mut state = match ctx.create_state() {
             Ok(s) => s,
             Err(err) => {
@@ -422,12 +669,10 @@ impl VoiceAssistantRuntime {
                 return None;
             }
         };
-
         if let Err(err) = state.full(params, audio_data) {
             eprintln!("Whisper transcription error: {}", err);
             return None;
         }
-
         Self::extract_transcription_text(&state)
     }
 
@@ -474,19 +719,13 @@ impl VoiceAssistantRuntime {
     /// initialization fails.
     fn init_whisper() -> Result<whisper_rs::WhisperContext> {
         use whisper_rs::WhisperContext;
-
-        // Create models directory if it doesn't exist
         fs::create_dir_all("models")?;
-
-        // Download model if not present
         if !Path::new(WHISPER_MODEL_PATH).exists() {
             eprintln!("Downloading Whisper model (this may take a few minutes)...");
             Self::download_whisper_model()?;
         }
-
         let mut params = whisper_rs::WhisperContextParameters::default();
         params.use_gpu(false);
-
         WhisperContext::new_with_params(WHISPER_MODEL_PATH, params)
             .with_context(|| "Failed to initialize Whisper")
     }
@@ -510,17 +749,13 @@ impl VoiceAssistantRuntime {
     fn download_whisper_model() -> Result<()> {
         const MODEL_URL: &str =
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
-
-        // Use curl to download instead of blocking reqwest
         let output = std::process::Command::new("curl")
             .args(["-L", "-o", WHISPER_MODEL_PATH, MODEL_URL])
             .output()
             .with_context(|| "Failed to execute curl")?;
-
         if !output.status.success() {
             anyhow::bail!("Failed to download Whisper model");
         }
-
         eprintln!("Whisper model downloaded successfully");
         Ok(())
     }
@@ -544,32 +779,106 @@ impl VoiceAssistantRuntime {
     /// Returns an error if the file cannot be opened, is not a valid WAV format,
     /// or sample reading fails.
     fn load_audio_for_whisper(path: &str) -> Result<Vec<f32>> {
-        let reader = hound::WavReader::open(path)
-            .with_context(|| format!("Failed to open WAV file: {}", path))?;
-
+        let reader = Self::open_wav_reader(path)?;
         let spec = reader.spec();
-        let samples: Vec<i16> = reader
+        let samples = Self::read_wav_samples(reader)?;
+        let audio_data = Self::normalize_samples(&samples);
+        let resampled = Self::maybe_resample(audio_data, spec.sample_rate);
+        Ok(Self::maybe_downmix(resampled, spec.channels))
+    }
+
+    /// Opens a WAV file reader.
+    ///
+    /// # Details
+    /// Creates a buffered WAV reader for the specified file path.
+    ///
+    /// # Arguments
+    /// * `path` - The filesystem path to the WAV file.
+    ///
+    /// # Returns
+    /// * `Ok(WavReader)` - Successfully opened WAV file reader.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be opened or is not a valid WAV.
+    fn open_wav_reader(path: &str) -> Result<hound::WavReader<std::io::BufReader<std::fs::File>>> {
+        hound::WavReader::open(path).with_context(|| format!("Failed to open WAV file: {}", path))
+    }
+
+    /// Reads all samples from a WAV file.
+    ///
+    /// # Details
+    /// Iterates through the WAV file and collects all i16 PCM samples.
+    ///
+    /// # Arguments
+    /// * `reader` - The WAV file reader to read from.
+    ///
+    /// # Returns
+    /// * `Ok(Vec<i16>)` - All samples from the WAV file.
+    ///
+    /// # Errors
+    /// Returns an error if sample reading fails.
+    fn read_wav_samples(
+        reader: hound::WavReader<std::io::BufReader<std::fs::File>>,
+    ) -> Result<Vec<i16>> {
+        reader
             .into_samples::<i16>()
             .collect::<Result<Vec<_>, _>>()
-            .with_context(|| "Failed to read WAV samples")?;
+            .with_context(|| "Failed to read WAV samples")
+    }
 
-        // Convert to f32 and normalize
-        let mut audio_data: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+    /// Normalizes i16 samples to f32 range [-1.0, 1.0].
+    ///
+    /// # Details
+    /// Divides each i16 sample by 32768.0 to map from integer to float range.
+    ///
+    /// # Arguments
+    /// * `samples` - The i16 PCM samples to normalize.
+    ///
+    /// # Returns
+    /// * `Vec<f32>` - Normalized samples in [-1.0, 1.0] range.
+    fn normalize_samples(samples: &[i16]) -> Vec<f32> {
+        samples.iter().map(|&s| s as f32 / 32768.0).collect()
+    }
 
-        // Resample to 16kHz if needed (Whisper expects 16kHz)
-        if spec.sample_rate != 16000 {
-            audio_data = Self::resample(&audio_data, spec.sample_rate, 16000);
+    /// Resamples audio if needed.
+    ///
+    /// # Details
+    /// Converts audio to 16 kHz if the current sample rate differs from target.
+    ///
+    /// # Arguments
+    /// * `audio_data` - The audio samples to potentially resample.
+    /// * `sample_rate` - The current sample rate in Hz.
+    ///
+    /// # Returns
+    /// * `Vec<f32>` - Audio resampled to 16 kHz, or original if already 16 kHz.
+    fn maybe_resample(audio_data: Vec<f32>, sample_rate: u32) -> Vec<f32> {
+        if sample_rate != 16000 {
+            Self::resample(&audio_data, sample_rate, 16000)
+        } else {
+            audio_data
         }
+    }
 
-        // Convert stereo to mono if needed
-        if spec.channels == 2 {
-            audio_data = audio_data
+    /// Converts stereo to mono if needed.
+    ///
+    /// # Details
+    /// Averages left and right channels when stereo audio is detected.
+    ///
+    /// # Arguments
+    /// * `audio_data` - The audio samples to potentially downmix.
+    /// * `channels` - The number of channels in the audio.
+    ///
+    /// # Returns
+    /// * `Vec<f32>` - Mono audio, or original if already mono.
+    fn maybe_downmix(audio_data: Vec<f32>, channels: u16) -> Vec<f32> {
+        if channels == 2 {
+            audio_data
                 .chunks(2)
                 .map(|chunk| (chunk[0] + chunk[1]) / 2.0)
-                .collect();
+                .collect()
+        } else {
+            audio_data
         }
-
-        Ok(audio_data)
     }
 
     /// Resamples audio data from one sample rate to another using linear interpolation.
@@ -590,24 +899,57 @@ impl VoiceAssistantRuntime {
     /// * `Vec<f32>` - Resampled audio data at the target rate, with length
     ///   proportional to the rate conversion ratio.
     fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-        // Simple linear interpolation resampling
         let ratio = from_rate as f32 / to_rate as f32;
         let output_len = (input.len() as f32 / ratio) as usize;
+        Self::interpolate_audio(input, ratio, output_len)
+    }
+
+    /// Performs linear interpolation on audio samples.
+    ///
+    /// # Details
+    /// Generates output samples by interpolating between input samples at positions
+    /// determined by the resampling ratio. Uses linear interpolation to estimate
+    /// values between discrete input samples.
+    ///
+    /// # Arguments
+    /// * `input` - Source audio samples to interpolate from.
+    /// * `ratio` - Resampling ratio (from_rate / to_rate).
+    /// * `output_len` - Number of output samples to generate.
+    ///
+    /// # Returns
+    /// * `Vec<f32>` - Interpolated audio samples at the target length.
+    fn interpolate_audio(input: &[f32], ratio: f32, output_len: usize) -> Vec<f32> {
         let mut output = Vec::with_capacity(output_len);
-
         for i in 0..output_len {
-            let pos = i as f32 * ratio;
-            let idx = pos as usize;
-            if idx + 1 < input.len() {
-                let frac = pos - idx as f32;
-                let sample = input[idx] * (1.0 - frac) + input[idx + 1] * frac;
-                output.push(sample);
-            } else if idx < input.len() {
-                output.push(input[idx]);
-            }
+            let sample = Self::sample_at_position(input, i as f32 * ratio);
+            output.push(sample);
         }
-
         output
+    }
+
+    /// Gets an interpolated sample at a specific position.
+    ///
+    /// # Details
+    /// Performs linear interpolation between adjacent input samples at the given
+    /// fractional position. Returns the boundary sample when at array edges, or
+    /// zero when position exceeds input length.
+    ///
+    /// # Arguments
+    /// * `input` - The source audio samples to interpolate from.
+    /// * `pos` - Fractional position in the input array (may be non-integer).
+    ///
+    /// # Returns
+    /// * `f32` - Interpolated sample value at the specified position.
+    fn sample_at_position(input: &[f32], pos: f32) -> f32 {
+        let idx = pos as usize;
+        if idx + 1 < input.len() {
+            let frac = pos - idx as f32;
+            input[idx] * (1.0 - frac) + input[idx + 1] * frac
+        } else if idx < input.len() {
+            input[idx]
+        } else {
+            0.0
+        }
     }
 
     /// Handles post-transcription logic such as exit detection and speaking.
@@ -637,6 +979,18 @@ impl VoiceAssistantRuntime {
     }
 
     /// Checks for Pico control intents and handles them locally.
+    ///
+    /// # Details
+    /// Parses the user's utterance to detect LED control commands (on/off).
+    /// If a valid command is found, sends it to the Pico over UART and speaks
+    /// a confirmation message. Updates conversation history with the exchange.
+    /// This enables local hardware control without requiring an LLM round-trip.
+    ///
+    /// # Arguments
+    /// * `user_text` - The user's transcribed utterance to analyze for device commands.
+    ///
+    /// # Returns
+    /// * `bool` - `true` if a device command was detected and handled, `false` otherwise.
     fn try_device_command(&mut self, user_text: &str) -> bool {
         let allow_pronoun_reference = self.led_context_active;
         let Some(command) = DeviceCommand::from_text(user_text, allow_pronoun_reference) else {
@@ -682,20 +1036,17 @@ impl VoiceAssistantRuntime {
                 flip its LED on or off and confirm what action you just triggered."
                 .to_string(),
         };
-
         let mut messages = vec![system_message];
         messages.extend(self.history.clone());
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: user_text.to_string(),
         });
-
         let request = OllamaRequest {
             model: self.ollama_model.clone(),
             messages,
             stream: false,
         };
-
         let response = self
             .client
             .post(OLLAMA_API_URL)
@@ -703,12 +1054,10 @@ impl VoiceAssistantRuntime {
             .send()
             .await
             .with_context(|| "Failed to send request to Ollama")?;
-
         let ollama_response: OllamaResponse = response
             .json()
             .await
             .with_context(|| "Failed to parse Ollama response")?;
-
         Ok(ollama_response.message.content)
     }
 
@@ -763,8 +1112,16 @@ impl VoiceAssistantRuntime {
 }
 
 /// RAII guard that removes the temporary WAV file at scope exit.
+///
+/// # Details
+/// Ensures automatic cleanup of temp.wav using RAII pattern. The file
+/// is deleted when the guard goes out of scope, even on early returns.
 struct TempAudioGuard;
 
+/// Implementation of TempAudioGuard construction.
+///
+/// # Details
+/// Provides a constructor for the RAII guard. Cleanup logic is in the Drop impl.
 impl TempAudioGuard {
     /// Creates a guard instance; cleanup happens in `Drop`.
     ///
@@ -775,6 +1132,11 @@ impl TempAudioGuard {
     }
 }
 
+/// Drop implementation to ensure temp file cleanup.
+///
+/// # Details
+/// Automatically removes temp.wav when the guard goes out of scope,
+/// ensuring cleanup even on panic or early return.
 impl Drop for TempAudioGuard {
     /// Ensures the temp file is always removed, even on early returns.
     fn drop(&mut self) {
@@ -839,6 +1201,11 @@ enum DeviceCommand {
     LedOff,
 }
 
+/// LED-related target tokens for command parsing.
+///
+/// # Details
+/// Provides methods to parse user utterances, generate UART payloads,
+/// create confirmation messages, and define acknowledgment patterns.
 impl DeviceCommand {
     /// Parses user text to extract LED control commands.
     ///
@@ -961,6 +1328,11 @@ impl DeviceCommand {
     }
 }
 
+/// Implementation of UART device command methods.
+///
+/// # Details
+/// Provides methods for sending commands to the Raspberry Pi Pico over serial,
+/// handling acknowledgments, and managing the serial port lifecycle.
 impl VoiceAssistantRuntime {
     /// Sends a command to the Pico over UART with acknowledgment and retry logic.
     ///
@@ -979,42 +1351,86 @@ impl VoiceAssistantRuntime {
     /// Returns an error if both attempts fail to receive acknowledgment.
     fn send_device_command(&mut self, command: DeviceCommand) -> Result<()> {
         let payload = command.serial_bytes();
-        let mut last_err = None;
+        match self.try_command_with_retry(command, payload) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Attempts a command with one retry on failure.
+    ///
+    /// # Details
+    /// Tries sending the UART command twice, reopening the port between retries.
+    ///
+    /// # Arguments
+    /// * `command` - The device command to execute.
+    /// * `payload` - The raw bytes to transmit.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Command was acknowledged.
+    ///
+    /// # Errors
+    /// Returns an error if both attempts fail to receive acknowledgment.
+    fn try_command_with_retry(&mut self, command: DeviceCommand, payload: &[u8]) -> Result<()> {
         for attempt in 0..2 {
-            let path = self.serial_path.clone();
-            match self.write_uart_payload(payload) {
-                Ok(_) => {
-                    eprintln!(
-                        "[UART send] {} -> {} (attempt {})",
-                        path,
-                        command.label(),
-                        attempt + 1
-                    );
-                    if self.await_command_ack(command)? {
-                        return Ok(());
-                    } else {
-                        eprintln!(
-                            "UART ack missing for {} on {}, retrying",
-                            command.label(),
-                            path
-                        );
-                        self.serial = None;
-                    }
-                }
-                Err(err) => {
-                    eprintln!("UART write error on {}: {}", path, err);
-                    last_err = Some(err);
-                    self.serial = None;
-                }
+            if self.try_single_command_attempt(command, payload, attempt)? {
+                return Ok(());
             }
         }
-        if let Some(err) = last_err {
-            Err(err)
-        } else {
-            anyhow::bail!(
-                "UART did not acknowledge command {} even after retries",
-                command.label()
-            )
+        anyhow::bail!(
+            "UART did not acknowledge command {} even after retries",
+            command.label()
+        )
+    }
+
+    /// Executes one command attempt.
+    ///
+    /// # Details
+    /// Writes the payload to UART and waits for acknowledgment from the Pico.
+    ///
+    /// # Arguments
+    /// * `command` - The device command being sent.
+    /// * `payload` - The raw command bytes.
+    /// * `attempt` - The attempt number for logging.
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Command acknowledged.
+    /// * `Ok(false)` - No acknowledgment received.
+    ///
+    /// # Errors
+    /// Returns an error if UART write fails.
+    fn try_single_command_attempt(
+        &mut self,
+        command: DeviceCommand,
+        payload: &[u8],
+        attempt: usize,
+    ) -> Result<bool> {
+        let path = self.serial_path.clone();
+        match self.write_uart_payload(payload) {
+            Ok(_) => {
+                eprintln!(
+                    "[UART send] {} -> {} (attempt {})",
+                    path,
+                    command.label(),
+                    attempt + 1
+                );
+                if self.await_command_ack(command)? {
+                    Ok(true)
+                } else {
+                    eprintln!(
+                        "UART ack missing for {} on {}, retrying",
+                        command.label(),
+                        path
+                    );
+                    self.serial = None;
+                    Ok(false)
+                }
+            }
+            Err(err) => {
+                eprintln!("UART write error on {}: {}", path, err);
+                self.serial = None;
+                Err(err)
+            }
         }
     }
 
@@ -1036,16 +1452,34 @@ impl VoiceAssistantRuntime {
     fn write_uart_payload(&mut self, payload: &[u8]) -> Result<()> {
         let path = self.serial_path.clone();
         let port = self.ensure_serial_port()?;
-        // Clear stale data before sending new command
         drain_serial_input(port);
+        Self::send_payload_bytes(port, payload, &path)?;
+        std::thread::sleep(SERIAL_COMMAND_DELAY);
+        Ok(())
+    }
+
+    /// Sends payload bytes with newline and flush.
+    ///
+    /// # Details
+    /// Writes the command bytes, appends newline framing, and flushes the buffer.
+    ///
+    /// # Arguments
+    /// * `port` - The serial port to write to.
+    /// * `payload` - The command bytes to transmit.
+    /// * `path` - The device path for error messages.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Payload successfully sent and flushed.
+    ///
+    /// # Errors
+    /// Returns an error if write or flush operations fail.
+    fn send_payload_bytes(port: &mut dyn SerialPort, payload: &[u8], path: &str) -> Result<()> {
         port.write_all(payload)
             .with_context(|| format!("Failed to write to {}", path))?;
         port.write_all(b"\n")
             .with_context(|| format!("Failed to send newline to {}", path))?;
         port.flush()
-            .with_context(|| format!("Failed to flush {}", path))?;
-        std::thread::sleep(SERIAL_COMMAND_DELAY);
-        Ok(())
+            .with_context(|| format!("Failed to flush {}", path))
     }
 
     /// Waits for acknowledgment from the Pico after sending a command.
@@ -1067,36 +1501,85 @@ impl VoiceAssistantRuntime {
     fn await_command_ack(&mut self, command: DeviceCommand) -> Result<bool> {
         let deadline = Instant::now() + SERIAL_ACK_TIMEOUT;
         let port = self.ensure_serial_port()?;
+        Self::poll_for_ack(port, command, deadline)
+    }
+
+    /// Polls the serial port until acknowledgment or timeout.
+    ///
+    /// # Details
+    /// Reads from the serial port repeatedly until timeout or valid ack is found.
+    ///
+    /// # Arguments
+    /// * `port` - The serial port to read from.
+    /// * `command` - The command to match acknowledgment against.
+    /// * `deadline` - The absolute time when polling should stop.
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Valid acknowledgment received.
+    /// * `Ok(false)` - Timeout expired without acknowledgment.
+    ///
+    /// # Errors
+    /// Returns an error for unexpected I/O failures.
+    fn poll_for_ack(
+        port: &mut dyn SerialPort,
+        command: DeviceCommand,
+        deadline: Instant,
+    ) -> Result<bool> {
         let mut scratch = [0_u8; SERIAL_READ_CHUNK];
         let mut transcript = String::new();
         while Instant::now() < deadline {
-            match port.read(&mut scratch) {
-                Ok(0) => {}
-                Ok(n) => {
-                    let raw = String::from_utf8_lossy(&scratch[..n]).replace('\r', "");
-                    if !raw.trim().is_empty() {
-                        eprintln!("[UART ack] {}", raw.trim());
-                    }
-                    transcript.push_str(&raw.to_lowercase());
-                    if command
-                        .ack_tokens()
-                        .iter()
-                        .any(|token| transcript.contains(token))
-                    {
-                        return Ok(true);
-                    }
-                }
-                Err(err) => match err.kind() {
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut => {}
-                    _ => {
-                        eprintln!("UART ack error: {}", err);
-                        return Ok(false);
-                    }
-                },
+            if Self::process_serial_read(port, &mut scratch, &mut transcript, command)? {
+                return Ok(true);
             }
             std::thread::sleep(SERIAL_ACK_SLEEP);
         }
         Ok(false)
+    }
+
+    /// Processes one serial read attempt.
+    ///
+    /// # Details
+    /// Reads from the port, accumulates data, and checks for acknowledgment tokens.
+    ///
+    /// # Arguments
+    /// * `port` - The serial port to read from.
+    /// * `scratch` - The temporary read buffer.
+    /// * `transcript` - The accumulated text buffer.
+    /// * `command` - The command to check acknowledgment against.
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Acknowledgment found.
+    /// * `Ok(false)` - No acknowledgment yet, continue polling.
+    ///
+    /// # Errors
+    /// Returns an error for unexpected I/O failures.
+    fn process_serial_read(
+        port: &mut dyn SerialPort,
+        scratch: &mut [u8],
+        transcript: &mut String,
+        command: DeviceCommand,
+    ) -> Result<bool> {
+        match port.read(scratch) {
+            Ok(0) => Ok(false),
+            Ok(n) => {
+                let raw = String::from_utf8_lossy(&scratch[..n]).replace('\r', "");
+                if !raw.trim().is_empty() {
+                    eprintln!("[UART ack] {}", raw.trim());
+                }
+                transcript.push_str(&raw.to_lowercase());
+                Ok(command
+                    .ack_tokens()
+                    .iter()
+                    .any(|token| transcript.contains(token)))
+            }
+            Err(err) => match err.kind() {
+                ErrorKind::WouldBlock | ErrorKind::TimedOut => Ok(false),
+                _ => {
+                    eprintln!("UART ack error: {}", err);
+                    Ok(false)
+                }
+            },
+        }
     }
 
     /// Opens the serial port if not already connected, with fallback to callout variant.
@@ -1117,29 +1600,7 @@ impl VoiceAssistantRuntime {
     /// Returns an error if both primary and fallback ports cannot be opened.
     fn ensure_serial_port(&mut self) -> Result<&mut dyn SerialPort> {
         if self.serial.is_none() {
-            let mut port = match Self::open_serial_port(&self.serial_path, self.serial_baud) {
-                Ok(port) => port,
-                Err(primary_err) => {
-                    if let Some(callout) = callout_variant(&self.serial_path) {
-                        match Self::open_serial_port(&callout, self.serial_baud) {
-                            Ok(port) => {
-                                eprintln!(
-                                    "Primary port {} unavailable, switching to {}",
-                                    self.serial_path, callout
-                                );
-                                self.serial_path = callout;
-                                port
-                            }
-                            Err(_) => return Err(primary_err),
-                        }
-                    } else {
-                        return Err(primary_err);
-                    }
-                }
-            };
-            let _ = port.write_data_terminal_ready(true);
-            let _ = port.write_request_to_send(true);
-            std::thread::sleep(SERIAL_BOOT_DELAY);
+            let port = self.open_port_with_fallback()?;
             self.serial = Some(port);
         }
         Ok(self
@@ -1148,8 +1609,95 @@ impl VoiceAssistantRuntime {
             .map(|port| port.as_mut())
             .expect("serial port missing after initialization"))
     }
+
+    /// Opens serial port with fallback to callout variant.
+    ///
+    /// # Details
+    /// Attempts primary port first, then tries callout variant on failure.
+    /// Configures DTR/RTS and waits for boot delay.
+    ///
+    /// # Arguments
+    /// None.
+    ///
+    /// # Returns
+    /// * `Ok(Box<dyn SerialPort>)` - Configured serial port ready for use.
+    ///
+    /// # Errors
+    /// Returns an error if both primary and fallback ports cannot be opened.
+    fn open_port_with_fallback(&mut self) -> Result<Box<dyn SerialPort>> {
+        let mut port = self.try_primary_then_fallback()?;
+        configure_port_signals(&mut port);
+        Ok(port)
+    }
+
+    /// Tries primary port then fallback variant.
+    ///
+    /// # Details
+    /// Opens primary port or switches to callout variant on failure.
+    ///
+    /// # Arguments
+    /// None.
+    ///
+    /// # Returns
+    /// * `Ok(Box<dyn SerialPort>)` - Successfully opened port.
+    ///
+    /// # Errors
+    /// Returns an error if both ports fail to open.
+    fn try_primary_then_fallback(&mut self) -> Result<Box<dyn SerialPort>> {
+        match Self::open_serial_port(&self.serial_path, self.serial_baud) {
+            Ok(port) => Ok(port),
+            Err(primary_err) => self.try_fallback_port(primary_err),
+        }
+    }
+
+    /// Attempts to open callout variant port.
+    ///
+    /// # Details
+    /// Tries cu.* variant when tty.* fails, updates path on success.
+    ///
+    /// # Arguments
+    /// * `primary_err` - Error from primary port attempt.
+    ///
+    /// # Returns
+    /// * `Ok(Box<dyn SerialPort>)` - Opened fallback port.
+    ///
+    /// # Errors
+    /// Returns primary error if no fallback exists or fails.
+    fn try_fallback_port(&mut self, primary_err: anyhow::Error) -> Result<Box<dyn SerialPort>> {
+        let Some(callout) = callout_variant(&self.serial_path) else {
+            return Err(primary_err);
+        };
+        match Self::open_serial_port(&callout, self.serial_baud) {
+            Ok(port) => {
+                eprintln!(
+                    "Primary port {} unavailable, switching to {}",
+                    self.serial_path, callout
+                );
+                self.serial_path = callout;
+                Ok(port)
+            }
+            Err(_) => Err(primary_err),
+        }
+    }
 }
 
+/// Configures serial port control signals.
+///
+/// # Details
+/// Sets DTR and RTS signals and waits for Pico boot delay.
+///
+/// # Arguments
+/// * `port` - The serial port to configure.
+fn configure_port_signals(port: &mut Box<dyn SerialPort>) {
+    let _ = port.write_data_terminal_ready(true);
+    let _ = port.write_request_to_send(true);
+    std::thread::sleep(SERIAL_BOOT_DELAY);
+}
+
+/// Implementation of serial port opening utility.
+///
+/// # Details
+/// Provides low-level serial port opening functionality with timeout configuration.
 impl VoiceAssistantRuntime {
     /// Opens a serial port with the specified path and baud rate.
     ///
@@ -1253,12 +1801,22 @@ fn callout_variant(path: &str) -> Option<String> {
     Some(format!("/dev/cu.{}", suffix))
 }
 
+/// Represents a single memory entry in persistent storage.
+///
+/// # Details
+/// Stores one utterance from either the user or assistant along with
+/// its role. Entries are serialized to JSON for conversation persistence.
 #[derive(Clone, Serialize, Deserialize)]
 struct MemoryEntry {
     role: MemoryRole,
     text: String,
 }
 
+/// Role designation for memory entries.
+///
+/// # Details
+/// Distinguishes between user input and assistant responses in the
+/// persistent conversation log.
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum MemoryRole {
@@ -1266,6 +1824,7 @@ enum MemoryRole {
     Assistant,
 }
 
+/// Implementation of memory entry construction.
 impl MemoryEntry {
     /// Creates a new memory entry with the specified role and text.
     ///
@@ -1375,6 +1934,21 @@ fn load_app_config() -> AppConfig {
 /// * `String` - The fallback device path ("/dev/cu.usbmodem21402").
 fn fallback_serial_port() -> String {
     FALLBACK_SERIAL_PORT.to_string()
+}
+
+/// Returns the hardcoded fallback Ollama model name.
+///
+/// # Details
+/// Provides the default Ollama model used when no configuration is available.
+/// This function exists to satisfy serde's default attribute requirements.
+///
+/// # Arguments
+/// None.
+///
+/// # Returns
+/// * `String` - The fallback model name ("llama3.2:3b").
+fn fallback_ollama_model() -> String {
+    "llama3.2:3b".to_string()
 }
 
 #[cfg(test)]
