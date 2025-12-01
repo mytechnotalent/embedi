@@ -48,7 +48,7 @@ The application auto-starts Ollama if needed, downloads the model on first run, 
 
 <br>
 
-# Raspberry Pi Pico LED Control
+# Raspberry Pi Pico 2 LED Control
 - Flash your Pico with the `rp2350-comms` firmware (see below).
 - Connect the Pico USB to your Mac; note the device path (typically `/dev/cu.usbmodem1402`).
 - Optional: override defaults via environment variables:
