@@ -10,3 +10,6 @@ target/
 
 # memory file
 memory.json
+
+# Whisper models
+models/
