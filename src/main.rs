@@ -38,5 +38,18 @@ use embedi::assistant;
 /// assistant loop.
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
-    assistant::run_voice_assistant().await
+
+    // Set up Ctrl+C handler to clean up temp files
+    let result = tokio::select! {
+        res = assistant::run_voice_assistant() => res,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\nReceived Ctrl+C, cleaning up...");
+            assistant::cleanup_temp_files();
+            Ok(())
+        }
+    };
+
+    // Always cleanup on exit
+    assistant::cleanup_temp_files();
+    result
 }

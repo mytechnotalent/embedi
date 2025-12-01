@@ -37,11 +37,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rig::completion::{Chat, Prompt};
-use rig::message::Message;
-use rig::prelude::*;
-use rig::providers::groq;
-use rig::transcription::TranscriptionModel;
 use serde::{Deserialize, Serialize};
 use serialport::SerialPort;
 
@@ -77,6 +72,15 @@ const MEMORY_PATH: &str = "memory.json";
 
 /// Default baud rate used for Pico UART commands.
 const DEFAULT_SERIAL_BAUD: u32 = 115_200;
+
+/// Ollama API endpoint for local LLM inference.
+const OLLAMA_API_URL: &str = "http://localhost:11434/api/chat";
+
+/// Default Ollama model to use.
+const DEFAULT_OLLAMA_MODEL: &str = "llama3.2:3b";
+
+/// Whisper model path (will be auto-downloaded if not present).
+const WHISPER_MODEL_PATH: &str = "models/ggml-base.en.bin";
 
 /// Serial write timeout to avoid blocking the microphone loop.
 const SERIAL_TIMEOUT: Duration = Duration::from_millis(100);
@@ -138,10 +142,19 @@ pub async fn run_voice_assistant() -> Result<()> {
     VoiceAssistantRuntime::new()?.run_loop().await
 }
 
-/// Runtime container that owns the Groq client and conversation state.
+/// Cleans up temporary files created during operation.
+///
+/// This function is safe to call multiple times and will not fail if files don't exist.
+pub fn cleanup_temp_files() {
+    cleanup_temp_file();
+}
+
+/// Runtime container that owns the HTTP client and conversation state.
 struct VoiceAssistantRuntime {
-    client: groq::Client,
-    history: Vec<Message>,
+    client: reqwest::Client,
+    ollama_model: String,
+    whisper_ctx: Option<whisper_rs::WhisperContext>,
+    history: Vec<ChatMessage>,
     serial: Option<Box<dyn SerialPort>>,
     serial_path: String,
     serial_baud: u32,
@@ -149,14 +162,32 @@ struct VoiceAssistantRuntime {
     led_context_active: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct OllamaRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct OllamaResponse {
+    message: ChatMessage,
+}
+
 impl VoiceAssistantRuntime {
-    /// Creates a new runtime by loading Groq credentials from the environment.
+    /// Creates a new runtime by loading configuration.
     ///
     /// # Returns
     /// A ready-to-run [`VoiceAssistantRuntime`] with an empty conversation history.
     ///
     /// # Errors
-    /// Propagates failures from [`groq::Client::from_env`].
+    /// Propagates failures from initialization.
     fn new() -> Result<Self> {
         let memory_entries = match load_memory_entries() {
             Ok(entries) => entries,
@@ -167,13 +198,22 @@ impl VoiceAssistantRuntime {
         };
         let mut history = Vec::new();
         for entry in &memory_entries {
-            if let Some(message) = entry.to_message() {
-                history.push(message);
-            }
+            history.push(ChatMessage {
+                role: match entry.role {
+                    MemoryRole::User => "user".to_string(),
+                    MemoryRole::Assistant => "assistant".to_string(),
+                },
+                content: entry.text.clone(),
+            });
         }
         let config = load_app_config();
+        let ollama_model =
+            env::var("OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
+
         Ok(Self {
-            client: groq::Client::from_env(),
+            client: reqwest::Client::new(),
+            ollama_model,
+            whisper_ctx: None,
             history,
             serial: None,
             serial_path: serial_port_path(&config),
@@ -267,29 +307,153 @@ impl VoiceAssistantRuntime {
         energy.sqrt() >= SILENCE_RMS_THRESHOLD
     }
 
-    /// Sends the temporary WAV file to Groq Whisper for transcription.
+    /// Sends the temporary WAV file to local Whisper for transcription.
     ///
     /// # Returns
     /// * `Some(text)` when Whisper succeeds.
     /// * `None` when the error has already been logged and the loop should continue.
-    async fn transcribe_current_audio(&self) -> Option<String> {
-        match self
-            .client
-            .transcription_model(groq::WHISPER_LARGE_V3_TURBO)
-            .transcription_request()
-            .load_file(TEMP_AUDIO_PATH)
-            .send()
-            .await
-        {
-            Ok(data) => {
-                let text = data.text.trim().to_string();
-                Some(text)
-            }
-            Err(err) => {
-                eprintln!("Transcription error: {}", err);
-                None
+    async fn transcribe_current_audio(&mut self) -> Option<String> {
+        // Initialize Whisper context if needed
+        if self.whisper_ctx.is_none() {
+            match Self::init_whisper() {
+                Ok(ctx) => self.whisper_ctx = Some(ctx),
+                Err(err) => {
+                    eprintln!("Whisper init error: {}", err);
+                    return None;
+                }
             }
         }
+
+        let ctx = self.whisper_ctx.as_ref()?;
+
+        // Load and convert audio
+        let audio_data = match Self::load_audio_for_whisper(TEMP_AUDIO_PATH) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("Audio load error: {}", err);
+                return None;
+            }
+        };
+
+        // Create parameters
+        let mut params =
+            whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
+        params.set_language(Some("en"));
+        params.set_print_progress(false);
+        params.set_print_special(false);
+        params.set_print_realtime(false);
+
+        // Run transcription
+        let mut state = match ctx.create_state() {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("Whisper state error: {}", err);
+                return None;
+            }
+        };
+
+        if let Err(err) = state.full(params, &audio_data) {
+            eprintln!("Whisper transcription error: {}", err);
+            return None;
+        }
+
+        let num_segments = state.full_n_segments().unwrap_or(0);
+        let mut text = String::new();
+        for i in 0..num_segments {
+            if let Ok(segment) = state.full_get_segment_text(i) {
+                text.push_str(&segment);
+                text.push(' ');
+            }
+        }
+
+        Some(text.trim().to_string())
+    }
+
+    fn init_whisper() -> Result<whisper_rs::WhisperContext> {
+        use whisper_rs::WhisperContext;
+
+        // Create models directory if it doesn't exist
+        fs::create_dir_all("models")?;
+
+        // Download model if not present
+        if !Path::new(WHISPER_MODEL_PATH).exists() {
+            eprintln!("Downloading Whisper model (this may take a few minutes)...");
+            Self::download_whisper_model()?;
+        }
+
+        WhisperContext::new_with_params(
+            WHISPER_MODEL_PATH,
+            whisper_rs::WhisperContextParameters::default(),
+        )
+        .with_context(|| "Failed to initialize Whisper")
+    }
+
+    fn download_whisper_model() -> Result<()> {
+        const MODEL_URL: &str =
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+
+        // Use curl to download instead of blocking reqwest
+        let output = std::process::Command::new("curl")
+            .args(["-L", "-o", WHISPER_MODEL_PATH, MODEL_URL])
+            .output()
+            .with_context(|| "Failed to execute curl")?;
+
+        if !output.status.success() {
+            anyhow::bail!("Failed to download Whisper model");
+        }
+
+        eprintln!("Whisper model downloaded successfully");
+        Ok(())
+    }
+
+    fn load_audio_for_whisper(path: &str) -> Result<Vec<f32>> {
+        let reader = hound::WavReader::open(path)
+            .with_context(|| format!("Failed to open WAV file: {}", path))?;
+
+        let spec = reader.spec();
+        let samples: Vec<i16> = reader
+            .into_samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| "Failed to read WAV samples")?;
+
+        // Convert to f32 and normalize
+        let mut audio_data: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+
+        // Resample to 16kHz if needed (Whisper expects 16kHz)
+        if spec.sample_rate != 16000 {
+            audio_data = Self::resample(&audio_data, spec.sample_rate, 16000);
+        }
+
+        // Convert stereo to mono if needed
+        if spec.channels == 2 {
+            audio_data = audio_data
+                .chunks(2)
+                .map(|chunk| (chunk[0] + chunk[1]) / 2.0)
+                .collect();
+        }
+
+        Ok(audio_data)
+    }
+
+    fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+        // Simple linear interpolation resampling
+        let ratio = from_rate as f32 / to_rate as f32;
+        let output_len = (input.len() as f32 / ratio) as usize;
+        let mut output = Vec::with_capacity(output_len);
+
+        for i in 0..output_len {
+            let pos = i as f32 * ratio;
+            let idx = pos as usize;
+            if idx + 1 < input.len() {
+                let frac = pos - idx as f32;
+                let sample = input[idx] * (1.0 - frac) + input[idx + 1] * frac;
+                output.push(sample);
+            } else if idx < input.len() {
+                output.push(input[idx]);
+            }
+        }
+
+        output
     }
 
     /// Handles post-transcription logic such as exit detection and speaking.
@@ -339,7 +503,7 @@ impl VoiceAssistantRuntime {
         true
     }
 
-    /// Requests a Groq completion given the latest user input.
+    /// Requests an Ollama completion given the latest user input.
     ///
     /// # Parameters
     /// * `user_text` - The user's most recent utterance.
@@ -348,30 +512,50 @@ impl VoiceAssistantRuntime {
     /// A response string suitable for playback.
     ///
     /// # Errors
-    /// Translates groq-specific prompt errors into [`anyhow::Error`].
-    async fn fetch_response(&self, user_text: &str) -> Result<String> {
-        let agent = self
-            .client
-            .agent("llama-3.3-70b-versatile")
-            .preamble(
-                "You are Embedi, an embedded-systems AI assistant. Your name is pronounced \n
-                'em bee dee'—like Auntie Em, the letter B, then the letter D. Share that \n
-                phrasing only when someone asks or when pronunciation confusion blocks the \n
-                conversation, and always add that any close pronunciation is fine. Stay \n
-                personable, concise, friendly, and a little playful while keeping guidance \n
-                grounded in embedded-systems thinking. Never sound combative or defensive \n
-                about your name. Keep replies short and conversational, and when asked who \n
-                created you, cite Kevin Thomas as your creator. When users want to toggle \n
-                hardware, explain that you can speak over a Raspberry Pi Pico UART link to \n
-                flip its LED on or off and confirm what action you just triggered.",
-            )
-            .build();
-        let pending = if self.history.is_empty() {
-            agent.prompt(user_text).await
-        } else {
-            agent.chat(user_text, self.history.clone()).await
+    /// Translates Ollama-specific errors into [`anyhow::Error`].
+    async fn fetch_response(&mut self, user_text: &str) -> Result<String> {
+        let system_message = ChatMessage {
+            role: "system".to_string(),
+            content: "You are Embedi, an embedded-systems AI assistant. Your name is pronounced \
+                'em bee dee'—like Auntie Em, the letter B, then the letter D. Share that \
+                phrasing only when someone asks or when pronunciation confusion blocks the \
+                conversation, and always add that any close pronunciation is fine. Stay \
+                personable, concise, friendly, and a little playful while keeping guidance \
+                grounded in embedded-systems thinking. Never sound combative or defensive \
+                about your name. Keep replies short and conversational, and when asked who \
+                created you, cite Kevin Thomas as your creator. When users want to toggle \
+                hardware, explain that you can speak over a Raspberry Pi Pico UART link to \
+                flip its LED on or off and confirm what action you just triggered."
+                .to_string(),
         };
-        pending.map_err(|err| anyhow::anyhow!(err))
+
+        let mut messages = vec![system_message];
+        messages.extend(self.history.clone());
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: user_text.to_string(),
+        });
+
+        let request = OllamaRequest {
+            model: self.ollama_model.clone(),
+            messages,
+            stream: false,
+        };
+
+        let response = self
+            .client
+            .post(OLLAMA_API_URL)
+            .json(&request)
+            .send()
+            .await
+            .with_context(|| "Failed to send request to Ollama")?;
+
+        let ollama_response: OllamaResponse = response
+            .json()
+            .await
+            .with_context(|| "Failed to parse Ollama response")?;
+
+        Ok(ollama_response.message.content)
     }
 
     /// Stores the latest user/assistant exchange for conversational context.
@@ -380,8 +564,14 @@ impl VoiceAssistantRuntime {
     /// * `user_text` - The user's utterance.
     /// * `response` - The assistant's reply.
     fn store_exchange(&mut self, user_text: &str, response: &str) {
-        self.history.push(Message::user(user_text));
-        self.history.push(Message::assistant(response));
+        self.history.push(ChatMessage {
+            role: "user".to_string(),
+            content: user_text.to_string(),
+        });
+        self.history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: response.to_string(),
+        });
         self.record_memory(user_text, response);
     }
 
@@ -712,13 +902,6 @@ impl MemoryEntry {
         Self {
             role,
             text: text.into(),
-        }
-    }
-
-    fn to_message(&self) -> Option<Message> {
-        match self.role {
-            MemoryRole::User => Some(Message::user(self.text.clone())),
-            MemoryRole::Assistant => Some(Message::assistant(self.text.clone())),
         }
     }
 }
