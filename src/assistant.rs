@@ -86,8 +86,6 @@ const SERIAL_BOOT_DELAY: Duration = Duration::from_millis(150);
 /// Minimum spacing between consecutive UART commands.
 const SERIAL_COMMAND_DELAY: Duration = Duration::from_millis(30);
 
-
-
 /// Strongly typed representation of `config.json`.
 #[derive(Clone, Deserialize)]
 struct AppConfig {
