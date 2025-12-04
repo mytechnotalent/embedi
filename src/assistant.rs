@@ -1364,8 +1364,6 @@ impl VoiceAssistantRuntime {
     }
 }
 
-
-
 /// Determines the serial port path from environment variable or configuration.
 ///
 /// # Details
